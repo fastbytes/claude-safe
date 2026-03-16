@@ -48,6 +48,3 @@ test-output/
 *.pem
 credentials.json
 .credentials.json
-
-# Local scratch directories
-new/
