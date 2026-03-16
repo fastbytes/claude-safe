@@ -1,0 +1,191 @@
+# claude-safe custom template — K8s + DevOps + general development tools
+# Base: docker/sandbox-templates:claude-code (includes Node.js, Python, Go, Git, Docker CLI, grep, sed, awk, curl)
+# Adds: K8s toolchain, search tools, build essentials, GitHub CLI, postgres client, network tools
+#
+# Build:  docker build -t claude-safe -f Dockerfile.claude-safe .
+# Works on both arm64 (Apple Silicon / OrbStack) and amd64
+
+FROM docker/sandbox-templates:claude-code
+USER root
+
+# Detect architecture once — reuse in all RUN steps
+# TARGETARCH is set by BuildKit (arm64 or amd64)
+ARG TARGETARCH
+
+# ── System packages ──
+RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
+    build-essential \
+    jq \
+    ripgrep \
+    fd-find \
+    shellcheck \
+    postgresql-client \
+    tmux \
+    ncurses-term \
+    locales \
+    unzip \
+    zip \
+    less \
+    wget \
+    socat \
+    netcat-openbsd \
+    fzf \
+    tree \
+    procps \
+    dnsutils \
+    iputils-ping \
+    strace \
+    sqlite3 \
+    vim \
+    zsh \
+    nmap \
+    tcpdump \
+    direnv \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/fdfind /usr/local/bin/fd \
+    && sed -i '/en_US.UTF-8/s/^# //g' /etc/locale.gen && locale-gen
+
+ENV LANG=en_US.UTF-8 LC_ALL=en_US.UTF-8
+
+# ── kubectl ──
+RUN curl -fsSL "https://dl.k8s.io/release/$(curl -fsSL https://dl.k8s.io/release/stable.txt)/bin/linux/${TARGETARCH}/kubectl" \
+      -o /usr/local/bin/kubectl && chmod +x /usr/local/bin/kubectl
+
+# ── helm (auto-detects arch) ──
+RUN curl -fsSL https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3 | bash
+
+# ── k9s ──
+RUN LATEST=$(curl -fsSL https://api.github.com/repos/derailed/k9s/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/derailed/k9s/releases/download/${LATEST}/k9s_Linux_${TARGETARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin k9s
+
+# ── stern (multi-pod log tailing) ──
+RUN LATEST=$(curl -fsSL https://api.github.com/repos/stern/stern/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && VERSION="${LATEST#v}" \
+    && curl -fsSL "https://github.com/stern/stern/releases/download/${LATEST}/stern_${VERSION}_linux_${TARGETARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin stern
+
+# ── yq (YAML processor) ──
+RUN curl -fsSL "https://github.com/mikefarah/yq/releases/latest/download/yq_linux_${TARGETARCH}" \
+      -o /usr/local/bin/yq && chmod +x /usr/local/bin/yq
+
+# ── GitHub CLI ──
+RUN DPKG_ARCH=$(dpkg --print-architecture) \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+      -o /usr/share/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=${DPKG_ARCH} signed-by=/usr/share/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+      > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update -qq && apt-get install -y -qq gh && rm -rf /var/lib/apt/lists/*
+
+# ── delta (better git diffs) ──
+RUN DPKG_ARCH=$(dpkg --print-architecture) \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/dandavison/delta/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/dandavison/delta/releases/download/${LATEST}/git-delta_${LATEST#v}_${DPKG_ARCH}.deb" \
+       -o /tmp/delta.deb && dpkg -i /tmp/delta.deb && rm /tmp/delta.deb
+
+# ── bat (better cat, syntax highlighting) ──
+RUN DPKG_ARCH=$(dpkg --print-architecture) \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/sharkdp/bat/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/sharkdp/bat/releases/download/${LATEST}/bat_${LATEST#v}_${DPKG_ARCH}.deb" \
+       -o /tmp/bat.deb && dpkg -i /tmp/bat.deb && rm /tmp/bat.deb
+
+# ── websocat (WebSocket client) ──
+RUN ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/vi/websocat/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/vi/websocat/releases/download/${LATEST}/websocat.${ARCH}-unknown-linux-musl" \
+       -o /usr/local/bin/websocat && chmod +x /usr/local/bin/websocat
+
+# ── xh (modern HTTP client) ──
+RUN ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/ducaale/xh/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/ducaale/xh/releases/download/${LATEST}/xh-${LATEST}-${ARCH}-unknown-linux-musl.tar.gz" \
+       | tar xz --strip-components=1 -C /usr/local/bin --wildcards "*/xh"
+
+# ── age (file encryption) ──
+RUN LATEST=$(curl -fsSL https://api.github.com/repos/FiloSottile/age/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/FiloSottile/age/releases/download/${LATEST}/age-${LATEST}-linux-${TARGETARCH}.tar.gz" \
+       | tar xz --strip-components=1 -C /usr/local/bin age/age age/age-keygen
+
+# ── sops (secret decryption) ──
+RUN LATEST=$(curl -fsSL https://api.github.com/repos/getsops/sops/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/getsops/sops/releases/download/${LATEST}/sops-${LATEST}.linux.${TARGETARCH}" \
+       -o /usr/local/bin/sops && chmod +x /usr/local/bin/sops
+
+# ── grpcurl ──
+RUN ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "x86_64" || echo "$TARGETARCH") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/fullstorydev/grpcurl/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/fullstorydev/grpcurl/releases/download/${LATEST}/grpcurl_${LATEST#v}_linux_${ARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin grpcurl
+
+# ── wscat (interactive WebSocket client) ──
+RUN npm install -g wscat
+
+# ── kubectx + kubens ──
+RUN ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "x86_64" || echo "$TARGETARCH") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/ahmetb/kubectx/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/ahmetb/kubectx/releases/download/${LATEST}/kubectx_${LATEST}_linux_${ARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin kubectx \
+    && curl -fsSL "https://github.com/ahmetb/kubectx/releases/download/${LATEST}/kubens_${LATEST}_linux_${ARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin kubens
+
+# ── kustomize ──
+RUN cd /tmp && curl -fsSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" \
+       | bash && mv /tmp/kustomize /usr/local/bin/kustomize
+
+# ── croc (file transfer) ──
+RUN ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "ARM64" || echo "64bit") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/schollz/croc/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/schollz/croc/releases/download/${LATEST}/croc_${LATEST}_Linux-${ARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin croc
+
+# ── mkcert (local TLS certs) ──
+RUN LATEST=$(curl -fsSL https://api.github.com/repos/FiloSottile/mkcert/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/FiloSottile/mkcert/releases/download/${LATEST}/mkcert-${LATEST}-linux-${TARGETARCH}" \
+       -o /usr/local/bin/mkcert && chmod +x /usr/local/bin/mkcert
+
+# ── task (Taskfile runner) ──
+RUN LATEST=$(curl -fsSL https://api.github.com/repos/go-task/task/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/go-task/task/releases/download/${LATEST}/task_linux_${TARGETARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin task
+
+# ── just (command runner) ──
+RUN ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/casey/just/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/casey/just/releases/download/${LATEST}/just-${LATEST}-${ARCH}-unknown-linux-musl.tar.gz" \
+       | tar xz -C /usr/local/bin just
+
+# ── httpx (HTTP prober) ──
+RUN LATEST=$(curl -fsSL https://api.github.com/repos/projectdiscovery/httpx/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/projectdiscovery/httpx/releases/download/${LATEST}/httpx_${LATEST#v}_linux_${TARGETARCH}.zip" \
+       -o /tmp/httpx.zip && unzip -q /tmp/httpx.zip httpx -d /usr/local/bin \
+    && chmod +x /usr/local/bin/httpx && rm /tmp/httpx.zip
+
+# ── lazygit ──
+RUN ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "x86_64" || echo "$TARGETARCH") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/jesseduffield/lazygit/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/jesseduffield/lazygit/releases/download/${LATEST}/lazygit_${LATEST#v}_Linux_${ARCH}.tar.gz" \
+       | tar xz -C /usr/local/bin lazygit
+
+# ── atuin (shell history) ──
+RUN ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") \
+    && LATEST=$(curl -fsSL https://api.github.com/repos/atuinsh/atuin/releases/latest | grep tag_name | cut -d'"' -f4) \
+    && curl -fsSL "https://github.com/atuinsh/atuin/releases/download/${LATEST}/atuin-${ARCH}-unknown-linux-musl.tar.gz" \
+       | tar xz --strip-components=1 -C /usr/local/bin --wildcards "*/atuin"
+
+# ── grml zsh config + ~/.zshrc.d/ support ──
+RUN curl -fsSL https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc -o /etc/zsh/zshrc \
+    && printf '\n# Source ~/.zshrc.d/ drop-ins\nif [[ -d "${ZDOTDIR:-$HOME}/.zshrc.d" ]]; then\n  for _f in "${ZDOTDIR:-$HOME}"/.zshrc.d/*.{sh,zsh}(N); do\n    source "$_f"\n  done\nfi\n' \
+       >> /etc/zsh/zshrc \
+    && chsh -s /bin/zsh agent \
+    && printf '\n# direnv\neval "$(direnv hook zsh)"\n\n# atuin\neval "$(atuin init zsh)"\n' \
+       >> /etc/zsh/zshrc
+
+# ── direnv config (auto-allow by default; override with DIRENV_CONFIG=/etc/direnv-strict) ──
+RUN mkdir -p /etc/direnv /etc/direnv-strict \
+    && printf '[whitelist]\nprefix = ["/"]\n' > /etc/direnv/direnv.toml
+ENV DIRENV_CONFIG=/etc/direnv
+
+# ── grml vim config ──
+RUN curl -fsSL https://git.grml.org/f/grml-etc-core/etc/vim/vimrc -o /etc/vim/vimrc.local
+
+USER agent
