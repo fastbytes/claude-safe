@@ -166,18 +166,13 @@ RUN ARCH=$([ "$TARGETARCH" = "amd64" ] && echo "x86_64" || echo "$TARGETARCH") \
     && curl -fsSL "https://github.com/jesseduffield/lazygit/releases/download/${LATEST}/lazygit_${LATEST#v}_Linux_${ARCH}.tar.gz" \
        | tar xz -C /usr/local/bin lazygit
 
-# ── atuin (shell history) ──
-RUN ARCH=$([ "$TARGETARCH" = "arm64" ] && echo "aarch64" || echo "x86_64") \
-    && LATEST=$(curl -fsSL https://api.github.com/repos/atuinsh/atuin/releases/latest | grep tag_name | cut -d'"' -f4) \
-    && curl -fsSL "https://github.com/atuinsh/atuin/releases/download/${LATEST}/atuin-${ARCH}-unknown-linux-musl.tar.gz" \
-       | tar xz --strip-components=1 -C /usr/local/bin --wildcards "*/atuin"
-
 # ── grml zsh config + ~/.zshrc.d/ support ──
 RUN curl -fsSL https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc -o /etc/zsh/zshrc \
     && printf '\n# Source ~/.zshrc.d/ drop-ins\nif [[ -d "${ZDOTDIR:-$HOME}/.zshrc.d" ]]; then\n  for _f in "${ZDOTDIR:-$HOME}"/.zshrc.d/*.{sh,zsh}(N); do\n    source "$_f"\n  done\nfi\n' \
        >> /etc/zsh/zshrc \
     && chsh -s /bin/zsh agent \
-    && printf '\n# direnv\neval "$(direnv hook zsh)"\n\n# atuin\neval "$(atuin init zsh)"\n' \
+    && touch /home/agent/.zshrc && chown agent:agent /home/agent/.zshrc \
+    && printf '\n# direnv\neval "$(direnv hook zsh)"\n' \
        >> /etc/zsh/zshrc
 
 # ── direnv config (auto-allow by default; override with DIRENV_CONFIG=/etc/direnv-strict) ──
