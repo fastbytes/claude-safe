@@ -701,33 +701,19 @@ cmd_install() {
     _ihead "Preflight checks"
     command -v docker &>/dev/null || { _error "Docker not found. Install OrbStack, Colima, or Docker Desktop first."; exit 1; }
     _info "Docker: $(docker --version | head -1)"
-    if docker buildx version &>/dev/null 2>&1; then
-        _info "docker buildx: $(docker buildx version 2>/dev/null | head -1)"
-    else
-        _warn "docker buildx not found — required for builds"
-        if [[ "$(uname)" == "Darwin" ]]; then
-            _info "Install: brew install docker-buildx"
-            _info "Link:    mkdir -p ~/.docker/cli-plugins && ln -sfn \$(brew --prefix)/opt/docker-buildx/bin/docker-buildx ~/.docker/cli-plugins/"
-        else
-            _info "See: https://github.com/docker/buildx#installing"
-        fi
-    fi
     local _creds_store=""
-    [[ -f "$HOME/.docker/config.json" ]] && _creds_store="$(grep -o '"credsStore"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.docker/config.json" 2>/dev/null | grep -o '"[^"]*"$' | tr -d '"')"
+    if command -v jq &>/dev/null && [[ -f "$HOME/.docker/config.json" ]]; then
+        _creds_store="$(jq -r '.credsStore // empty' "$HOME/.docker/config.json" 2>/dev/null || true)"
+    elif [[ -f "$HOME/.docker/config.json" ]]; then
+        _creds_store="$(grep -o '"credsStore"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.docker/config.json" 2>/dev/null | grep -o '"[^"]*"$' | tr -d '"')"
+    fi
     if [[ -n "$_creds_store" ]]; then
         if command -v "docker-credential-${_creds_store}" &>/dev/null; then
             _info "docker-credential-${_creds_store}: found"
         else
             _warn "docker-credential-${_creds_store} not found (required by ~/.docker/config.json)"
-            [[ "$(uname)" == "Darwin" && "$_creds_store" == "osxkeychain" ]] \
+            command -v brew &>/dev/null \
                 && _info "Install: brew install docker-credential-helper"
-        fi
-    elif [[ "$(uname)" == "Darwin" ]]; then
-        if command -v docker-credential-osxkeychain &>/dev/null; then
-            _info "docker-credential-osxkeychain: found"
-        else
-            _warn "docker-credential-osxkeychain not found — recommended for registry auth on macOS"
-            _info "Install: brew install docker-credential-helper"
         fi
     fi
     command -v git &>/dev/null || { _error "Git not found."; exit 1; }
@@ -1242,19 +1228,18 @@ cmd_doctor() {
         else
             echo -e "  ${GREEN}✓${NC} Docker Engine ($server_info)"
         fi
-        # buildx check (required for builds)
+        # buildx check (optional — _docker_build() falls back to legacy builder)
         if docker buildx version &>/dev/null 2>&1; then
             echo -e "  ${GREEN}✓${NC} docker buildx"; ok=$((ok+1))
         else
-            echo -e "  ${RED}✗${NC} docker buildx (required for builds)"; f=$((f+1))
+            echo -e "  ${YELLOW}?${NC} docker buildx not found ${DIM}(builds will use legacy builder)${NC}"; w=$((w+1))
             if [[ "$(uname)" == "Darwin" ]]; then
                 echo -e "     ${DIM}Install: brew install docker-buildx${NC}"
-                echo -e "     ${DIM}Link:    mkdir -p ~/.docker/cli-plugins && ln -sfn \$(brew --prefix)/opt/docker-buildx/bin/docker-buildx ~/.docker/cli-plugins/${NC}"
             else
                 echo -e "     ${DIM}Install: https://github.com/docker/buildx#installing${NC}"
             fi
         fi
-        # credential helper check
+        # credential helper check (only when credsStore is configured)
         local _creds_store=""
         [[ -f "$HOME/.docker/config.json" ]] && _creds_store="$(grep -o '"credsStore"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.docker/config.json" 2>/dev/null | grep -o '"[^"]*"$' | tr -d '"')"
         if [[ -n "$_creds_store" ]]; then
@@ -1264,13 +1249,6 @@ cmd_doctor() {
                 echo -e "  ${RED}✗${NC} docker-credential-${_creds_store} not found (required by ~/.docker/config.json)"; f=$((f+1))
                 [[ "$(uname)" == "Darwin" && "$_creds_store" == "osxkeychain" ]] \
                     && echo -e "     ${DIM}Install: brew install docker-credential-helper${NC}"
-            fi
-        elif [[ "$(uname)" == "Darwin" ]]; then
-            if command -v docker-credential-osxkeychain &>/dev/null; then
-                echo -e "  ${GREEN}✓${NC} docker-credential-osxkeychain"; ok=$((ok+1))
-            else
-                echo -e "  ${YELLOW}?${NC} docker-credential-osxkeychain not found ${DIM}(recommended for registry auth)${NC}"; w=$((w+1))
-                echo -e "     ${DIM}Install: brew install docker-credential-helper${NC}"
             fi
         fi
     else
