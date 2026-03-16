@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6
+
+      - name: Bash syntax check
+        run: bash -n claude-safe
+
+      - name: ShellCheck
+        run: shellcheck -S error claude-safe
+
+      - name: Hadolint (Dockerfile lint)
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
+        with:
+          dockerfile: Dockerfile.claude-safe
+          failure-threshold: warning
+          ignore: DL3008,DL3059

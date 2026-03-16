@@ -1,0 +1,2257 @@
+#!/usr/bin/env bash
+# claude-safe v2.1.78 — Sandboxed Claude Code launcher
+#
+# Combines: Docker container isolation (OrbStack / Docker Engine), git worktree
+# management (cmux-compat), in-container tmux session management, granular
+# ~/.claude permissions, and remote-access optimizations.
+#
+# Architecture: tmux runs INSIDE the container. All panes/windows are sandboxed.
+# No host shell leakage. Ctrl-b d detaches → host shell. `claude-safe` reattaches.
+#
+# Usage:
+#   claude-safe                          Launch sandbox in current dir
+#   claude-safe new <branch> [prompt]    Worktree + sandbox + session
+#   claude-safe start <branch>           Reattach to existing session
+#   claude-safe ls                       List worktrees + containers + sessions
+#   claude-safe rm <branch>              Stop container + remove worktree
+#   claude-safe merge <branch> [--squash] Merge worktree into main
+#   claude-safe shell [branch]           Shell into sandbox (no tmux)
+#   claude-safe stop <branch>            Stop container
+#   claude-safe dash                     Container overview
+#   claude-safe init                     Generate .cmux/setup hook via Claude
+#   claude-safe config                   Show resolved configuration
+#   claude-safe doctor                   Verify dependencies + config
+#
+# Config: ~/.config/claude-safe/config  (or config.sh for legacy)
+
+set -euo pipefail
+
+CLAUDE_SAFE_VERSION="2.1.78"
+CLAUDE_SAFE_GHCR_IMAGE="ghcr.io/fastbytes/claude-safe"
+CLAUDE_SAFE_GITHUB_REPO="fastbytes/claude-safe"
+SCRIPT_NAME="claude-safe"
+SELF="$(realpath "${BASH_SOURCE[0]}")"
+
+# ─── Defaults (overridable via config or env) ────────────────────────────────
+
+: "${CLAUDE_SAFE_SANDBOX_MODE:=docker}"
+: "${CLAUDE_SAFE_TEMPLATE:=}"
+: "${CLAUDE_SAFE_CREDENTIALS:=host}"
+: "${CLAUDE_SAFE_NETWORK:=host}"
+
+: "${CLAUDE_SAFE_MOUNT_KUBE:=true}"
+: "${CLAUDE_SAFE_MOUNT_CLAUDE:=true}"
+: "${CLAUDE_SAFE_MOUNT_SSH:=true}"
+: "${CLAUDE_SAFE_SSH_MODE:=agent}"  # agent (default, forward SSH_AUTH_SOCK) or keys (mount ~/.ssh ro)
+: "${CLAUDE_SAFE_RO_DIRS:=$HOME/Code}"
+: "${CLAUDE_SAFE_RW_DIRS:=}"
+: "${CLAUDE_SAFE_KUBE_PROFILES:=}"
+: "${CLAUDE_SAFE_MOUNT_GITCONFIG:=true}"
+: "${CLAUDE_SAFE_MOUNT_GH:=true}"
+: "${CLAUDE_SAFE_MOUNT_TAILSCALE:=false}"
+: "${CLAUDE_SAFE_DOCKER_SOCKET:=false}"
+: "${CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM:=false}"
+: "${CLAUDE_SAFE_DIRENV_AUTO_ALLOW:=false}"
+: "${CLAUDE_SAFE_EXTRA_VOLUMES:=}"
+
+# Space-separated env var NAMES to forward from host into container (secrets/credentials)
+# Values are read from host env at launch time — never stored in config.
+: "${CLAUDE_SAFE_HOST_ENV:=}"
+# Space-separated KEY=VALUE pairs for static env vars
+: "${CLAUDE_SAFE_EXTRA_ENV:=}"
+
+CLAUDE_HOME="${HOME}/.claude"
+CLAUDE_JSON="${HOME}/.claude.json"
+
+# ~/.claude subdirs — WRITE-THROUGH (session data persists to host)
+CLAUDE_RW_DIRS=(projects plans todos file-history session-env shell-snapshots debug statsig ide telemetry teams sessions backups tasks)
+# ~/.claude subdirs — COPY-ON-WRITE (readable from host, writes stay in container)
+CLAUDE_COW_DIRS=(plugins output-styles cache paste-cache status_lines downloads)
+# ~/.claude files — WRITE-THROUGH
+CLAUDE_RW_FILES=(history.jsonl stats-cache.json mcp-needs-auth-cache.json)
+# ~/.claude files — COPY-ON-WRITE
+CLAUDE_COW_FILES=(settings.json)
+# .credentials.json is handled separately (Keychain extraction on macOS)
+# Everything else (CLAUDE.md, commands/, skills/, agents/, hooks/)
+# stays READ-ONLY via the base mount.
+# settings.json, .claude.json, and COW dirs are copy-on-write (host originals untouched).
+
+: "${CLAUDE_SAFE_MEMORY:=}"
+: "${CLAUDE_SAFE_CPUS:=}"
+
+: "${CLAUDE_SAFE_TMUX:=true}"
+: "${CLAUDE_SAFE_WORKTREE_DIR:=.worktrees}"
+: "${CLAUDE_SAFE_TMUX_PREFIX:=cs}"
+: "${CLAUDE_SAFE_SETUP_HOOK:=.cmux/setup}"
+: "${CLAUDE_SAFE_SETUP_HOOK_CONFIRM:=true}"
+: "${CLAUDE_SAFE_CLAUDE_ARGS:=}"
+: "${CLAUDE_SAFE_PERMISSION_MODE:=}"
+
+: "${CLAUDE_SAFE_TMUX_CONF:=}"
+: "${CLAUDE_SAFE_CONTAINER_TMUX_CONF:=/etc/tmux.conf}"
+# NOTIFY_CMD is intentionally not set from env here — it runs on the host with
+# full privileges, so it must only come from the config file (ownership-checked).
+# The env var is unset in _load_config before sourcing config.sh.
+: "${CLAUDE_SAFE_AUTO_CLEANUP:=true}"
+: "${CLAUDE_SAFE_BUILD_INTERVAL:=86400}"  # seconds between image pulls/builds (0=always, -1=never)
+: "${CLAUDE_SAFE_IMAGE_MODE:=}"          # "build" to force local builds instead of GHCR pull
+: "${CLAUDE_SAFE_VERSION_CHECK:=true}"
+
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-safe"
+CONFIG_FILE="${CONFIG_DIR}/config.sh"   # legacy bash config (deprecated)
+_GLOBAL_CONFIG_FILE=""
+_OVERRIDE_FILE=""
+_TRUSTED_FILE="${CONFIG_DIR}/trusted-overrides"
+
+# ─── Colors ──────────────────────────────────────────────────────────────────
+
+RED=$'\033[0;31m'; GREEN=$'\033[0;32m'; YELLOW=$'\033[1;33m'
+CYAN=$'\033[0;36m'; DIM=$'\033[0;2m'; BOLD=$'\033[1m'; NC=$'\033[0m'
+
+_info()  { echo -e "${GREEN}▸${NC} $*"; }
+_warn()  { echo -e "${YELLOW}▸${NC} $*" >&2; }
+_error() { echo -e "${RED}✗${NC} $*" >&2; }
+_dim()   { echo -e "${DIM}  $*${NC}"; }
+
+# ─── Image resolution helpers ─────────────────────────────────────────────────
+
+_is_custom_template() {
+    # True when user has set a custom image name or forced local-build mode.
+    [[ -n "$CLAUDE_SAFE_TEMPLATE" ]] || [[ "$CLAUDE_SAFE_IMAGE_MODE" == "build" ]]
+}
+
+_resolve_image() {
+    # Return the Docker image name to use: custom template or GHCR default.
+    if [[ -n "$CLAUDE_SAFE_TEMPLATE" ]]; then
+        echo "$CLAUDE_SAFE_TEMPLATE"
+    else
+        echo "${CLAUDE_SAFE_GHCR_IMAGE}:latest"
+    fi
+}
+
+_version_gt() {
+    # Return 0 (true) if version $1 is strictly greater than $2 (semver).
+    [[ "$1" == "$2" ]] && return 1
+    local _gt; _gt="$(printf '%s\n' "$1" "$2" | sort -rV | head -1)"
+    [[ "$_gt" == "$1" ]]
+}
+
+_get_latest_script_version() {
+    # Query GitHub releases API; print the latest version string (no leading v).
+    curl -sf --max-time 3 \
+        "https://api.github.com/repos/${CLAUDE_SAFE_GITHUB_REPO}/releases/latest" \
+        | grep -o '"tag_name"[[:space:]]*:[[:space:]]*"[^"]*"' | head -1 \
+        | grep -o '"[^"]*"$' | tr -d '"' | sed 's/^v//'
+}
+
+_asset_dir() {
+    # Return the directory where repo assets (Dockerfile, config.example, tmux.conf) live.
+    # If the script is running from a git checkout of this repo, use that checkout.
+    # Otherwise, return the managed shallow-clone path.
+    local script_dir="${SELF%/*}"
+    if git -C "$script_dir" rev-parse --show-toplevel &>/dev/null; then
+        local remote_url
+        remote_url="$(git -C "$script_dir" remote get-url origin 2>/dev/null || true)"
+        if [[ "$remote_url" == *"${CLAUDE_SAFE_GITHUB_REPO}"* ]]; then
+            git -C "$script_dir" rev-parse --show-toplevel
+            return 0
+        fi
+    fi
+    echo "${CONFIG_DIR}/repo"
+}
+
+_ensure_asset_repo() {
+    # Lazy-clone the repo on first use. No-op when running from a checkout.
+    local repo_dir="${CONFIG_DIR}/repo"
+    local asset_dir; asset_dir="$(_asset_dir)"
+    [[ "$asset_dir" != "$repo_dir" ]] && return 0  # running from checkout
+    [[ -d "$repo_dir/.git" ]] && return 0           # already cloned
+    _info "Cloning asset repository…"
+    git clone --depth=1 --single-branch \
+        "https://github.com/${CLAUDE_SAFE_GITHUB_REPO}.git" "$repo_dir" 2>/dev/null \
+        || { _warn "Asset clone failed — using fallback defaults"; return 1; }
+}
+
+_update_assets() {
+    # Sync asset repo to the tag matching the current script version.
+    # Called during cmd_update(). No-op when running from a checkout.
+    local asset_dir; asset_dir="$(_asset_dir)"
+    local repo_dir="${CONFIG_DIR}/repo"
+    if [[ "$asset_dir" != "$repo_dir" ]]; then
+        _dim "Assets: using local checkout at ${asset_dir}"
+        return 0
+    fi
+    _ensure_asset_repo || return 0
+    local tag="v${CLAUDE_SAFE_VERSION}"
+    _info "Updating assets to ${CYAN}${tag}${NC}…"
+    if git -C "$repo_dir" fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null \
+       && git -C "$repo_dir" checkout --quiet "$tag" 2>/dev/null; then
+        _info "Assets updated to ${CYAN}${tag}${NC}"
+    else
+        git -C "$repo_dir" fetch --depth=1 origin main 2>/dev/null \
+            && git -C "$repo_dir" reset --hard origin/main --quiet 2>/dev/null \
+            || _warn "Asset update failed — using cached version"
+    fi
+    # Update tmux.conf if previously installed
+    if [[ -f "${CONFIG_DIR}/tmux.conf" ]] && [[ -f "${asset_dir}/tmux.conf" ]]; then
+        cp "${asset_dir}/tmux.conf" "${CONFIG_DIR}/tmux.conf"
+        _dim "Updated tmux.conf"
+    fi
+}
+
+# ─── Config ──────────────────────────────────────────────────────────────────
+
+_parse_config() {
+    # Parse a declarative KEY=VALUE config file. No eval, no shell expansion.
+    # Only sets CLAUDE_SAFE_* variables. Second arg restrict_notify=true blocks
+    # CLAUDE_SAFE_NOTIFY_CMD (which executes on host — must only come from global config).
+    local file="$1" restrict_notify="${2:-false}"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        # Strip inline comments (not inside quotes — simple heuristic)
+        line="${line%%[[:space:]]#*}"
+        # Match KEY=VALUE
+        if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z_0-9]*)=(.*)[[:space:]]*$ ]]; then
+            local key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+            # Strip surrounding quotes
+            if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            # Expand $HOME and ~/
+            val="${val//\$HOME/$HOME}"
+            val="${val/#\~\//$HOME/}"
+            # Only set known CLAUDE_SAFE_* variables
+            case "$key" in
+                CLAUDE_SAFE_NOTIFY_CMD)
+                    [[ "$restrict_notify" == "true" ]] && continue
+                    printf -v "$key" '%s' "$val" ;;
+                CLAUDE_SAFE_*)
+                    printf -v "$key" '%s' "$val" ;;
+            esac
+        fi
+    done < "$file"
+}
+
+_check_file_security() {
+    local file="$1"
+    if [[ -L "$file" ]]; then
+        _warn "Config file is a symlink — skipping: $file"; return 1; fi
+    local _owner _perms
+    if [[ "$(uname)" == "Darwin" ]]; then
+        _owner="$(/usr/bin/stat -f '%u' "$file" 2>/dev/null)"
+        _perms="$(/usr/bin/stat -f '%A' "$file" 2>/dev/null)"
+    else
+        _owner="$(stat -c '%u' "$file" 2>/dev/null)"
+        _perms="$(stat -c '%a' "$file" 2>/dev/null)"
+    fi
+    if [[ "$_owner" != "$(id -u)" ]]; then
+        _warn "Config file not owned by current user — skipping: $file"; return 1; fi
+    if [[ "${_perms: -2:1}" == [2367] ]] || [[ "${_perms: -1:1}" == [2367] ]]; then
+        _warn "Config file is group/world-writable — skipping: $file"; return 1; fi
+    return 0
+}
+
+_init_config() {
+    mkdir -p "$CONFIG_DIR"
+    local config_declarative="${CONFIG_DIR}/config"
+    # Only create config if neither format exists yet
+    if [[ ! -f "$config_declarative" ]] && [[ ! -f "$CONFIG_FILE" ]]; then
+        _ensure_asset_repo 2>/dev/null
+        local asset_dir; asset_dir="$(_asset_dir)"
+        cp "${asset_dir}/config.example" "$config_declarative" 2>/dev/null \
+            || cp "${SELF%/*}/config.example" "$config_declarative" 2>/dev/null \
+            || { _info "Created empty config: ${config_declarative}"; touch "$config_declarative"; }
+    fi
+}
+
+_is_trusted() {
+    local path="$1"
+    [[ -f "$_TRUSTED_FILE" ]] && grep -qFx "$path" "$_TRUSTED_FILE" 2>/dev/null
+}
+
+_trust_override() {
+    local path="$1"
+    mkdir -p "$(dirname "$_TRUSTED_FILE")"
+    _is_trusted "$path" || echo "$path" >> "$_TRUSTED_FILE"
+}
+
+_untrust_override() {
+    local path="$1"
+    [[ -f "$_TRUSTED_FILE" ]] || return 0
+    local tmp; tmp="$(grep -vFx "$path" "$_TRUSTED_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$tmp" > "$_TRUSTED_FILE"
+}
+
+_load_project_override() {
+    _OVERRIDE_FILE=""
+    local project_root
+    project_root="$(_repo_root 2>/dev/null || echo "$PWD")"
+    local override="${project_root}/.claude-safe/config"
+    [[ -f "$override" ]] || return 0
+
+    if ! _is_trusted "$override"; then
+        # Interactive trust prompt (skip in non-interactive shells)
+        if [[ -t 0 ]]; then
+            _warn "Project override found: $override"
+            if _ask_yn "Trust and load this project override?" "n"; then
+                _trust_override "$override"
+            else
+                return 0
+            fi
+        else
+            return 0
+        fi
+    fi
+
+    _parse_config "$override" true   # restrict_notify=true
+    _OVERRIDE_FILE="$override"
+}
+
+_load_config() {
+    _init_config
+
+    # New declarative format takes precedence
+    local config_declarative="${CONFIG_DIR}/config"
+    if [[ -f "$config_declarative" ]]; then
+        _check_file_security "$config_declarative" || return 0
+        unset CLAUDE_SAFE_NOTIFY_CMD
+        _parse_config "$config_declarative" false
+        : "${CLAUDE_SAFE_NOTIFY_CMD:=}"
+        _GLOBAL_CONFIG_FILE="$config_declarative"
+    elif [[ -f "$CONFIG_FILE" ]]; then
+        # Legacy bash config — show migration warning
+        _check_file_security "$CONFIG_FILE" || return 0
+        _warn "Legacy config.sh detected. Run 'claude-safe config --migrate' to convert."
+        unset CLAUDE_SAFE_NOTIFY_CMD
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        : "${CLAUDE_SAFE_NOTIFY_CMD:=}"
+        _GLOBAL_CONFIG_FILE="$CONFIG_FILE"
+    else
+        _GLOBAL_CONFIG_FILE=""
+    fi
+
+    _load_project_override
+}
+
+# ─── Helpers ─────────────────────────────────────────────────────────────────
+
+_require() { for c in "$@"; do command -v "$c" &>/dev/null || { _error "Required: $c"; exit 1; }; done; }
+
+_ask() {
+    local prompt="$1" default="$2" var
+    printf "  %s [%s]: " "$prompt" "$default" >&2
+    read -r var
+    echo "${var:-$default}"
+}
+
+_ask_yn() {
+    local prompt="$1" default="$2" var
+    [[ "$default" == "true" ]] && default="y"
+    [[ "$default" == "false" ]] && default="n"
+    printf "  %s [%s]: " "$prompt" "$default" >&2
+    read -r var
+    var="${var:-$default}"
+    [[ "$var" =~ ^[Yy] ]]
+}
+
+_auto_setup_host() {
+    # Host-side setup: only tasks that must run before the container starts.
+    local wt_path="$1" main_root="$2"
+
+    # .env: symlink from main worktree if example exists but .env doesn't
+    if [[ -f "$wt_path/.env.example" ]] && [[ ! -f "$wt_path/.env" ]] && [[ -f "$main_root/.env" ]]; then
+        ln -sf "$main_root/.env" "$wt_path/.env"
+        _info "Symlinked .env from main worktree"
+    fi
+}
+
+_auto_setup_container() {
+    # Container-side setup: runs inside the sandbox before Claude starts.
+    local container="$1" wt_path="$2"
+
+    # Escape hatch: explicit setup script takes priority.
+    # Prompt for confirmation to prevent untrusted repos from auto-executing hooks
+    # that could exfiltrate mounted credentials (OAuth, GitHub tokens, kubeconfig).
+    if docker exec -w "$wt_path" "$container" test -x "./${CLAUDE_SAFE_SETUP_HOOK}" 2>/dev/null; then
+        if [[ "${CLAUDE_SAFE_SETUP_HOOK_CONFIRM:-true}" == "true" ]]; then
+            _warn "Setup hook found: ${CYAN}${CLAUDE_SAFE_SETUP_HOOK}${NC}"
+            if ! _ask_yn "Execute setup hook?" "n"; then
+                _info "Skipped setup hook"
+                return
+            fi
+        fi
+        _info "Setup: ${CLAUDE_SAFE_SETUP_HOOK}"
+        docker exec -w "$wt_path" "$container" bash -c "./${CLAUDE_SAFE_SETUP_HOOK}"
+        return
+    fi
+
+    # deps: detect by lock file, skip silently if tool not in container
+    docker exec -w "$wt_path" "$container" bash -c '
+        if   [[ -f pnpm-lock.yaml ]]   && command -v pnpm   &>/dev/null; then echo "pnpm install"       && pnpm install
+        elif [[ -f yarn.lock ]]         && command -v yarn   &>/dev/null; then echo "yarn install"       && yarn install
+        elif [[ -f bun.lockb ]]         && command -v bun    &>/dev/null; then echo "bun install"        && bun install
+        elif [[ -f package-lock.json ]] && command -v npm    &>/dev/null; then echo "npm install"        && npm install
+        elif [[ -f package.json ]]      && command -v npm    &>/dev/null; then echo "npm install"        && npm install
+        elif [[ -f uv.lock ]]           && command -v uv     &>/dev/null; then echo "uv sync"            && uv sync
+        elif [[ -f poetry.lock ]]       && command -v poetry &>/dev/null; then echo "poetry install"     && poetry install
+        elif [[ -f requirements.txt ]]  && command -v pip    &>/dev/null; then echo "pip install -r ..." && pip install -r requirements.txt
+        fi
+    ' || true
+}
+
+_build_claude_cmd() {
+    # Populates _cmd_parts array (dynamic scoping, same pattern as _add_docker_args).
+    # Caller appends extra args to _cmd_parts, then uses them.
+    _cmd_parts=("claude")
+    if [[ "$CLAUDE_SAFE_PERMISSION_MODE" == "bypass" ]]; then
+        _cmd_parts+=(--dangerously-skip-permissions --allow-dangerously-skip-permissions)
+    fi
+    if [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]]; then
+        local _ca_split; read -ra _ca_split <<< "$CLAUDE_SAFE_CLAUDE_ARGS"
+        _cmd_parts+=("${_ca_split[@]}")
+    fi
+}
+
+_create_tmux_in_container() {
+    # Create a tmux session inside a container and configure it.
+    local name="$1" session="$2" workspace="$3" claude_cmd="$4"
+    local tmux_args=()
+    [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]] \
+        && tmux_args+=(-f "$CLAUDE_SAFE_CONTAINER_TMUX_CONF")
+    docker exec "$name" tmux "${tmux_args[@]}" new-session -d -s "$session" -c "$workspace" "$claude_cmd"
+    docker exec "$name" tmux set-option -t "$session" default-command "zsh -l"
+    docker exec "$name" tmux set-environment -t "$session" CLAUDE_SAFE "true"
+    docker exec "$name" tmux set-environment -t "$session" CLAUDE_SAFE_WORKSPACE "$workspace"
+}
+
+_detect_creds_store() {
+    [[ -f "$HOME/.docker/config.json" ]] || return 1
+    if command -v jq &>/dev/null; then
+        jq -r '.credsStore // empty' "$HOME/.docker/config.json" 2>/dev/null
+    else
+        grep -o '"credsStore"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.docker/config.json" 2>/dev/null \
+            | grep -o '"[^"]*"$' | tr -d '"'
+    fi
+}
+_sanitize_branch() { echo "$1" | sed 's/[^a-zA-Z0-9._-]/-/g'; }
+_repo_root() { git rev-parse --show-toplevel 2>/dev/null || { _error "Not in a git repo"; exit 1; }; }
+
+_session_name() {
+    local project; project="$(basename "$(_repo_root)")"
+    echo "${CLAUDE_SAFE_TMUX_PREFIX}-${project}-$(_sanitize_branch "$1")"
+}
+
+_worktree_path() { echo "$(_repo_root)/${CLAUDE_SAFE_WORKTREE_DIR}/$(_sanitize_branch "$1")"; }
+
+_is_in_worktree() { [[ "$PWD" == "$(_repo_root)/${CLAUDE_SAFE_WORKTREE_DIR}"* ]]; }
+
+_current_worktree_branch() {
+    local wt_dir="$(_repo_root)/${CLAUDE_SAFE_WORKTREE_DIR}"
+    local rel="${PWD#"$wt_dir"/}"; echo "${rel%%/*}"
+}
+
+_ensure_claude_rw_dirs() {
+    for d in "${CLAUDE_RW_DIRS[@]}"; do mkdir -p "${CLAUDE_HOME}/${d}"; done
+    for d in "${CLAUDE_COW_DIRS[@]}"; do mkdir -p "${CLAUDE_HOME}/${d}"; done
+    for f in "${CLAUDE_RW_FILES[@]}"; do touch "${CLAUDE_HOME}/${f}" 2>/dev/null || true; done
+    for f in "${CLAUDE_COW_FILES[@]}"; do touch "${CLAUDE_HOME}/${f}" 2>/dev/null || true; done
+    # Ensure .credentials.json exists (needed as mount target) but mounted separately
+    touch "${CLAUDE_HOME}/.credentials.json" 2>/dev/null || true
+}
+
+_prepare_cow_staging() {
+    # Copy protected files/dirs to staging. Container mounts copies, not originals.
+    # Use a randomized path to prevent TOCTOU attacks on a predictable fixed path.
+    _COW_STAGING_DIR="$(mktemp -d "${CONFIG_DIR}/.cow-staging.XXXXXX")"
+    chmod 700 "$_COW_STAGING_DIR"
+    local cow_dir="$_COW_STAGING_DIR"
+
+    # COW dirs — cp -a preserves structure
+    for d in "${CLAUDE_COW_DIRS[@]}"; do
+        if [[ -d "${CLAUDE_HOME}/${d}" ]]; then
+            rm -rf "${cow_dir:?}/${d}" 2>/dev/null || true
+            cp -a "${CLAUDE_HOME}/${d}" "${cow_dir}/${d}"
+            # Remove symlinks pointing outside CLAUDE_HOME to prevent
+            # exfiltrating sensitive files (e.g., ~/.ssh/id_rsa) via mount
+            while IFS= read -r -d '' _link; do
+                local _target
+                _target="$(readlink -f "$_link" 2>/dev/null || true)"
+                if [[ -n "$_target" ]] && [[ "$_target" != "${CLAUDE_HOME}"/* ]]; then
+                    rm -f "$_link"
+                fi
+            done < <(find "${cow_dir}/${d}" -type l -print0 2>/dev/null)
+        else
+            mkdir -p "${cow_dir}/${d}"
+        fi
+    done
+
+    # COW files
+    for f in "${CLAUDE_COW_FILES[@]}"; do
+        [[ -f "${CLAUDE_HOME}/${f}" ]] && cp -f "${CLAUDE_HOME}/${f}" "${cow_dir}/${f}"
+    done
+
+    # ~/.claude.json (lives outside ~/.claude/)
+    [[ -f "$CLAUDE_JSON" ]] && cp -f "$CLAUDE_JSON" "${cow_dir}/claude.json"
+}
+
+_notify() {
+    if [[ -n "$CLAUDE_SAFE_NOTIFY_CMD" ]]; then
+        local _notify_arr
+        read -ra _notify_arr <<< "$CLAUDE_SAFE_NOTIFY_CMD"
+        "${_notify_arr[@]}" "$1" 2>/dev/null || true
+    fi
+    printf '\a'  # terminal bell — works over SSH/Mosh
+}
+
+# ─── Volume construction ────────────────────────────────────────────────────
+
+_add_claude_mounts() {
+    [[ "$CLAUDE_SAFE_MOUNT_CLAUDE" == "true" ]] || return 0
+    _ensure_claude_rw_dirs
+    local p="/home/agent/.claude"
+    local cow_dir="${_COW_STAGING_DIR:-${CONFIG_DIR}/.cow-staging}"
+
+    # 1. Base: entire ~/.claude READ-ONLY
+    cmd+=("-v" "${CLAUDE_HOME}:${p}:ro")
+
+    # 2. Overlay writable dirs (writes persist to host)
+    for d in "${CLAUDE_RW_DIRS[@]}"; do
+        [[ -d "${CLAUDE_HOME}/${d}" ]] && cmd+=("-v" "${CLAUDE_HOME}/${d}:${p}/${d}")
+    done
+
+    # 3. Overlay COW dirs (writes stay in container)
+    for d in "${CLAUDE_COW_DIRS[@]}"; do
+        [[ -d "${cow_dir}/${d}" ]] && cmd+=("-v" "${cow_dir}/${d}:${p}/${d}")
+    done
+
+    # 4. Overlay writable files (writes persist to host)
+    for f in "${CLAUDE_RW_FILES[@]}"; do
+        [[ -f "${CLAUDE_HOME}/${f}" ]] && cmd+=("-v" "${CLAUDE_HOME}/${f}:${p}/${f}")
+    done
+
+    # 5. Overlay COW files (writes stay in container)
+    for f in "${CLAUDE_COW_FILES[@]}"; do
+        [[ -f "${cow_dir}/${f}" ]] && cmd+=("-v" "${cow_dir}/${f}:${p}/${f}")
+    done
+
+    # 6. ~/.claude.json — COW (runtime counters, bypass acceptance)
+    [[ -f "${cow_dir}/claude.json" ]] && cmd+=("-v" "${cow_dir}/claude.json:/home/agent/.claude.json")
+}
+
+_build_filtered_kubeconfig() {
+    # Use a stable per-run dir (not mktemp) so it gets overwritten each launch instead of accumulating.
+    local tmp_dir="${CONFIG_DIR}/.kube-filtered"
+    rm -rf "$tmp_dir" 2>/dev/null || true
+    mkdir -p "$tmp_dir" && chmod 700 "$tmp_dir"
+    local merged="" _ifs="$IFS"
+    IFS=':'
+    for ctx in $CLAUDE_SAFE_KUBE_PROFILES; do
+        IFS="$_ifs"
+        local ctx_file="${tmp_dir}/${ctx}.yaml"
+        KUBECONFIG="${HOME}/.kube/config" kubectl config view \
+            --minify --flatten --context="$ctx" > "$ctx_file" 2>/dev/null || {
+            _warn "kube context not found: $ctx"
+            rm -f "$ctx_file"
+            continue
+        }
+        merged="${merged:+${merged}:}${ctx_file}"
+    done
+    IFS="$_ifs"
+    if [[ -n "$merged" ]]; then
+        KUBECONFIG="$merged" kubectl config view --flatten > "${tmp_dir}/config"
+    fi
+    rm -f "${tmp_dir}"/*.yaml
+    echo "$tmp_dir"
+}
+
+_add_volume_args() {
+    # Claude granular mounts
+    _add_claude_mounts
+
+    # Kubernetes
+    if [[ "$CLAUDE_SAFE_MOUNT_KUBE" == "true" ]] && [[ -d "$HOME/.kube" ]]; then
+        if [[ -n "$CLAUDE_SAFE_KUBE_PROFILES" ]]; then
+            local _kube_tmp; _kube_tmp="$(_build_filtered_kubeconfig)"
+            cmd+=("-v" "${_kube_tmp}:/home/agent/.kube:ro")
+        else
+            cmd+=("-v" "$HOME/.kube:/home/agent/.kube:ro")
+        fi
+    fi
+
+    # SSH — agent mode (default): forward socket + config/known_hosts only; keys mode: full ~/.ssh ro
+    if [[ "$CLAUDE_SAFE_MOUNT_SSH" == "true" ]] && [[ -d "$HOME/.ssh" ]]; then
+        if [[ "${CLAUDE_SAFE_SSH_MODE:-agent}" == "keys" ]]; then
+            cmd+=("-v" "$HOME/.ssh:/home/agent/.ssh:ro")
+        else
+            # agent mode: mount only non-secret files + forward SSH_AUTH_SOCK
+            [[ -f "$HOME/.ssh/config" ]]      && cmd+=("-v" "$HOME/.ssh/config:/home/agent/.ssh/config:ro")
+            [[ -f "$HOME/.ssh/known_hosts" ]] && cmd+=("-v" "$HOME/.ssh/known_hosts:/home/agent/.ssh/known_hosts:ro")
+            if [[ -n "${SSH_AUTH_SOCK:-}" ]] && [[ -S "${SSH_AUTH_SOCK:-}" ]]; then
+                cmd+=("-v" "${SSH_AUTH_SOCK}:${SSH_AUTH_SOCK}" "-e" "SSH_AUTH_SOCK=${SSH_AUTH_SOCK}")
+            fi
+        fi
+    fi
+
+    # Git config
+    [[ "$CLAUDE_SAFE_MOUNT_GITCONFIG" == "true" ]] && [[ -f "$HOME/.gitconfig" ]] \
+        && cmd+=("-v" "$HOME/.gitconfig:/home/agent/.gitconfig:ro")
+
+    # GitHub CLI config (gh auth tokens, hosts.yml)
+    [[ "$CLAUDE_SAFE_MOUNT_GH" == "true" ]] && [[ -d "$HOME/.config/gh" ]] \
+        && cmd+=("-v" "$HOME/.config/gh:/home/agent/.config/gh:ro")
+
+    # Read-only directories
+    if [[ -n "$CLAUDE_SAFE_RO_DIRS" ]]; then
+        local _ifs="$IFS"; IFS=':'
+        for _dir in $CLAUDE_SAFE_RO_DIRS; do
+            IFS="$_ifs"
+            [[ -d "$_dir" ]] && cmd+=("-v" "${_dir}:/home/agent/$(basename "$_dir"):ro")
+        done
+        IFS="$_ifs"
+    fi
+
+    # Read-write directories
+    if [[ -n "$CLAUDE_SAFE_RW_DIRS" ]]; then
+        local _ifs="$IFS"; IFS=':'
+        for _dir in $CLAUDE_SAFE_RW_DIRS; do
+            IFS="$_ifs"
+            [[ -d "$_dir" ]] && cmd+=("-v" "${_dir}:/home/agent/$(basename "$_dir"):rw")
+        done
+        IFS="$_ifs"
+    fi
+
+    # Tailscale socket
+    if [[ "$CLAUDE_SAFE_MOUNT_TAILSCALE" == "true" ]]; then
+        local ts="/var/run/tailscale/tailscaled.sock"
+        [[ -S "$ts" ]] && cmd+=("-v" "${ts}:${ts}:ro")
+    fi
+
+    # Extra user volumes
+    if [[ -n "$CLAUDE_SAFE_EXTRA_VOLUMES" ]]; then
+        for v in $CLAUDE_SAFE_EXTRA_VOLUMES; do cmd+=("-v" "$v"); done
+    fi
+}
+
+# ─── Container lifecycle ───────────────────────────────────────────────────
+
+_container_name() {
+    # Deterministic name from workspace path: cs-{project}-{branch_or_dir}-{hash}
+    local ws="$1"
+    local base; base="$(basename "$ws")"
+    local project; project="$(basename "$(dirname "$ws")")"
+    local hash; hash="$(echo "$ws" | (md5sum 2>/dev/null || md5) | cut -c1-6 2>/dev/null || echo "0")"
+    echo "cs-${project}-${base}-${hash}" | sed 's/[^a-zA-Z0-9-]/-/g' | head -c 63
+}
+
+_container_running() { docker inspect -f '{{.State.Running}}' "$1" 2>/dev/null | grep -q true; }
+_container_exists()  { docker inspect "$1" &>/dev/null; }
+
+_stop_container() {
+    local name="$1"
+    _container_running "$name" && docker stop -t 5 "$name" &>/dev/null
+    _container_exists "$name" && docker rm -f "$name" &>/dev/null
+    docker rm -f "cs-socket-proxy-${name}" &>/dev/null || true
+    rm -f "${CLAUDE_HOME}/.credentials.json"
+    if [[ -n "${_COW_STAGING_DIR:-}" ]]; then
+        rm -rf "$_COW_STAGING_DIR" 2>/dev/null || true
+    fi
+}
+
+# ─── Launch backends ────────────────────────────────────────────────────────
+
+_inject_keychain_creds() {
+    # macOS: extract OAuth tokens from Keychain → write to ~/.claude/.credentials.json.
+    # File lives in user-only ~/.claude/ (0700 parent). Re-extracted each launch.
+    # macOS-native Claude uses Keychain directly and ignores this file.
+    [[ "$(uname)" != "Darwin" ]] && return 1
+    local creds
+    creds="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)" || return 1
+    [[ -z "$creds" ]] && return 1
+    # Atomic creation with restricted permissions (avoids TOCTOU race with separate chmod).
+    (umask 077; printf '%s\n' "$creds" > "${CLAUDE_HOME}/.credentials.json")
+    _dim "→ OAuth credentials extracted from macOS Keychain"
+}
+
+_start_socket_proxy() {
+    local parent_name="$1"
+    local proxy_name="cs-socket-proxy-${parent_name}"
+
+    # Remove stale proxy if exists
+    docker rm -f "$proxy_name" &>/dev/null || true
+
+    docker run -d \
+        --name "$proxy_name" \
+        --network "$CLAUDE_SAFE_NETWORK" \
+        --restart unless-stopped \
+        -v /var/run/docker.sock:/var/run/docker.sock:ro \
+        -e LOG_LEVEL=warning \
+        -e CONTAINERS=1 \
+        -e IMAGES=1 \
+        -e NETWORKS=1 \
+        -e VOLUMES=1 \
+        -e BUILD=1 \
+        -e POST=1 \
+        -e ALLOW_START=1 \
+        -e ALLOW_STOP=1 \
+        -e ALLOW_RESTARTS=1 \
+        -e EXEC=0 \
+        -e AUTH=0 \
+        -e SECRETS=0 \
+        -e SWARM=0 \
+        -e NODES=0 \
+        -e SERVICES=0 \
+        -e TASKS=0 \
+        -e PLUGINS=0 \
+        -e SYSTEM=0 \
+        tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2 >/dev/null
+
+    _info "Docker socket proxy started (filtered API access)"
+}
+
+_add_docker_args() {
+    # Appends common docker run args to caller's 'cmd' array (bash dynamic scoping).
+    local workspace="$1" name="$2"
+
+    cmd+=(--name "$name" --hostname claude-safe
+        --network "$CLAUDE_SAFE_NETWORK"
+        -e TERM=xterm-256color
+        --label "claude-safe=true"
+        --label "claude-safe.workspace=$workspace"
+        --cap-drop=ALL
+        --security-opt=no-new-privileges)
+
+    [[ -n "$CLAUDE_SAFE_MEMORY" ]] && cmd+=(--memory "$CLAUDE_SAFE_MEMORY")
+    [[ -n "$CLAUDE_SAFE_CPUS" ]]   && cmd+=(--cpus "$CLAUDE_SAFE_CPUS")
+
+    cmd+=(-v "${workspace}:${workspace}" -w "${workspace}")
+    case "$CLAUDE_SAFE_DOCKER_SOCKET" in
+        proxy)
+            _start_socket_proxy "$name"
+            cmd+=(-e DOCKER_HOST=tcp://cs-socket-proxy-${name}:2375)
+            ;;
+        true)
+            if [[ "$CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM" != "true" ]]; then
+                _error "CLAUDE_SAFE_DOCKER_SOCKET=true gives the container full host root access."
+                _error "  Set CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM=true to acknowledge this risk."
+                _error "  Consider CLAUDE_SAFE_DOCKER_SOCKET=proxy for safer Docker access."
+                exit 1
+            fi
+            _warn "SECURITY: Docker socket mounted — container has full host root access"
+            cmd+=(-v /var/run/docker.sock:/var/run/docker.sock)
+            ;;
+    esac
+
+    _add_volume_args
+
+    [[ "$CLAUDE_SAFE_DIRENV_AUTO_ALLOW" == "false" ]] && cmd+=(-e DIRENV_CONFIG=/etc/direnv-strict)
+
+    [[ -n "${CLAUDE_SAFE_HOST_ENV:-}" ]] && {
+        for varname in $CLAUDE_SAFE_HOST_ENV; do
+            [[ -n "${!varname:-}" ]] && cmd+=(-e "${varname}=${!varname}") \
+                || _warn "HOST_ENV: $varname not set on host — skipping"
+        done
+    }
+    [[ -n "${CLAUDE_SAFE_EXTRA_ENV:-}" ]] && {
+        for kv in $CLAUDE_SAFE_EXTRA_ENV; do cmd+=(-e "$kv"); done
+    }
+
+    # Credentials (host file — populated by _inject_keychain_creds on macOS; read-only to prevent exfiltration/modification)
+    [[ -f "${CLAUDE_HOME}/.credentials.json" ]] && [[ -s "${CLAUDE_HOME}/.credentials.json" ]] \
+        && cmd+=(-v "${CLAUDE_HOME}/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+
+    # tmux config inside container
+    if [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]]; then
+        cmd+=(-v "${CLAUDE_SAFE_TMUX_CONF}:${CLAUDE_SAFE_CONTAINER_TMUX_CONF}:ro")
+    fi
+}
+
+_check_claude_version() {
+    # Compare installed Claude Code version against npm latest. Warn if stale.
+    local container="$1"
+    local installed latest
+    installed="$(docker exec "$container" claude --version 2>/dev/null | awk '{print $1}')" || return 0
+    latest="$(curl -sf --max-time 3 https://registry.npmjs.org/@anthropic-ai/claude-code/latest | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)" || return 0
+    [[ -z "$installed" || -z "$latest" ]] && return 0
+    [[ "$installed" == "$latest" ]] && return 0
+    _warn "Claude Code ${CYAN}${installed}${NC} installed — ${CYAN}${latest}${NC} available. Run: ${CYAN}claude-safe update${NC}"
+}
+
+_check_script_version() {
+    # Warn if a newer claude-safe release is available on GitHub.
+    local latest; latest="$(_get_latest_script_version)" || return 0
+    [[ -z "$latest" ]] && return 0
+    _version_gt "$latest" "$CLAUDE_SAFE_VERSION" || return 0
+    _warn "claude-safe ${CYAN}${CLAUDE_SAFE_VERSION}${NC} installed — ${CYAN}${latest}${NC} available. Run: ${CYAN}claude-safe update${NC}"
+}
+
+_self_update() {
+    # Download and install the latest claude-safe script from GitHub Releases.
+    local latest; latest="$(_get_latest_script_version)" || true
+    if [[ -z "$latest" ]]; then
+        _warn "Could not fetch latest version from GitHub — skipping script update"
+        return 0
+    fi
+
+    local install_bin="${CLAUDE_SAFE_INSTALL_BIN:-$HOME/.local/bin/claude-safe}"
+    install_bin="$(realpath "$install_bin" 2>/dev/null || echo "$install_bin")"
+    if [[ "$install_bin" != "$HOME"/* ]]; then
+        _error "CLAUDE_SAFE_INSTALL_BIN must be within \$HOME. Got: $install_bin"
+        return 1
+    fi
+
+    # When running from the install path, trust the version number to avoid
+    # unnecessary downloads on every update call.
+    if [[ "$SELF" == "$install_bin" ]] && ! _version_gt "$latest" "$CLAUDE_SAFE_VERSION"; then
+        _info "Script is up to date (v${CLAUDE_SAFE_VERSION})"
+        return 0
+    fi
+
+    local url="https://raw.githubusercontent.com/${CLAUDE_SAFE_GITHUB_REPO}/v${latest}/claude-safe"
+    local tmp; tmp="$(mktemp)"
+    if ! curl -fsSL --max-time 30 "$url" -o "$tmp"; then
+        _warn "Script download failed — skipping update"
+        rm -f "$tmp"; return 0
+    fi
+    if ! bash -n "$tmp" 2>/dev/null; then
+        _warn "Downloaded script failed syntax check — skipping update"
+        rm -f "$tmp"; return 0
+    fi
+
+    # Skip if installed binary already matches downloaded content (handles moved tags).
+    if [[ -f "$install_bin" ]] && diff -q "$tmp" "$install_bin" &>/dev/null; then
+        _info "Script is up to date (v${CLAUDE_SAFE_VERSION})"
+        rm -f "$tmp"; return 0
+    fi
+
+    if _version_gt "$latest" "$CLAUDE_SAFE_VERSION"; then
+        _info "Script update: ${CYAN}${CLAUDE_SAFE_VERSION}${NC} → ${CYAN}${latest}${NC}"
+    else
+        _info "Script refreshed: ${CYAN}v${latest}${NC}"
+    fi
+    cp "$tmp" "$install_bin"
+    chmod +x "$install_bin"
+    rm -f "$tmp"
+    _info "Script updated: ${CYAN}${install_bin}${NC} (v${latest})"
+    # If running from the install path, exec the new script to finish image update
+    if [[ "$SELF" == "$install_bin" ]]; then
+        exec "$install_bin" update --skip-script
+    fi
+}
+
+_pull_base_image() {
+    # Pull the base image from a Dockerfile's FROM line.
+    local dockerfile="$1"
+    local base_image
+    base_image="$(grep -m1 '^FROM ' "$dockerfile" | awk '{print $2}')"
+    [[ -z "$base_image" ]] && return 0
+    _info "Pulling base image: ${CYAN}${base_image}${NC}"
+    docker pull "$base_image" || _warn "Pull failed — using cached image"
+}
+
+_docker_build() {
+    # Build a Docker image with buildx if available, falling back to legacy builder.
+    # Usage: _docker_build -t <image> -f <dockerfile> [--no-cache] <context>
+    local args=("$@")
+    if docker buildx version &>/dev/null; then
+        docker buildx build "${args[@]}"
+    else
+        local arch; arch="$(uname -m)"
+        [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] && arch="arm64" || arch="amd64"
+        docker build --build-arg "TARGETARCH=${arch}" "${args[@]}"
+    fi
+}
+
+_maybe_update_image() {
+    # Pull or rebuild the image if stale (older than CLAUDE_SAFE_BUILD_INTERVAL).
+    # Skipped when interval is -1.
+    local image="$1"
+    [[ "$CLAUDE_SAFE_BUILD_INTERVAL" == "-1" ]] && return 0
+
+    local stamp_file="${CONFIG_DIR}/.last-update"
+    # One-time migration: rename old stamp file
+    [[ -f "${CONFIG_DIR}/.last-build" ]] && [[ ! -f "$stamp_file" ]] \
+        && mv "${CONFIG_DIR}/.last-build" "$stamp_file"
+    [[ -d "$CONFIG_DIR" ]] || mkdir -p "$CONFIG_DIR"
+
+    local now; now="$(date +%s)"
+    if [[ -f "$stamp_file" ]]; then
+        local last; last="$(<"$stamp_file")"
+        local age=$((now - last))
+        [[ "$CLAUDE_SAFE_BUILD_INTERVAL" != "0" ]] && [[ $age -lt $CLAUDE_SAFE_BUILD_INTERVAL ]] && return 0
+    fi
+
+    if _is_custom_template; then
+        # Custom template: local build (original behavior)
+        _dim "→ Rebuilding custom image…"
+        local dockerfile; dockerfile="$(_find_dockerfile)"
+        if [[ -f "$dockerfile" ]]; then
+            _pull_base_image "$dockerfile"
+            if _docker_build -f "$dockerfile" -t "$image" --build-arg "CLAUDE_CODE_CACHEBUST=$(date +%s)" "$(dirname "$dockerfile")"; then
+                echo "$now" > "$stamp_file"
+            else
+                _warn "Image build failed — using cached image"
+            fi
+        else
+            _warn "Dockerfile.claude-safe not found — skipping build"
+        fi
+    else
+        # Default: pull from GHCR
+        _dim "→ Pulling image from GHCR…"
+        if docker pull "$image"; then
+            echo "$now" > "$stamp_file"
+        else
+            _warn "Pull failed — checking for cached image"
+            docker image inspect "$image" &>/dev/null \
+                || _maybe_build_fallback "$image"
+        fi
+    fi
+}
+
+_maybe_build_fallback() {
+    # Last-resort local build when GHCR pull fails and no cached image exists.
+    local image="$1"
+    local dockerfile; dockerfile="$(_find_dockerfile)"
+    if [[ -f "$dockerfile" ]]; then
+        _dim "→ Falling back to local build…"
+        _pull_base_image "$dockerfile"
+        _docker_build -f "$dockerfile" -t "$image" --build-arg "CLAUDE_CODE_CACHEBUST=$(date +%s)" "$(dirname "$dockerfile")" \
+            || { _error "Local build also failed — cannot launch"; exit 1; }
+    else
+        _error "No cached image and no Dockerfile found — cannot launch"
+        exit 1
+    fi
+}
+
+_start_container() {
+    # Start container detached (for session mode). Container stays running until stopped.
+    local workspace="$1" name="$2"
+    local image; image="$(_resolve_image)"
+
+    _stop_container "$name"
+    _inject_keychain_creds || true
+    _prepare_cow_staging
+
+    _maybe_update_image "$image"
+
+    local cmd=(docker run -d)
+    _add_docker_args "$workspace" "$name"
+    cmd+=("$image" sleep infinity)
+
+    _dim "→ Starting container: $name"
+    "${cmd[@]}" >/dev/null
+}
+
+_launch_docker() {
+    # Interactive/ephemeral mode (--raw): replaces shell with docker run.
+    local workspace="$1"; shift; local ca=("$@")
+    _require docker
+
+    local image; image="$(_resolve_image)"
+    local name; name="$(_container_name "$workspace")"
+
+    _stop_container "$name"
+    _inject_keychain_creds || true
+    _prepare_cow_staging
+
+    _maybe_update_image "$image"
+
+    local cmd=(docker run --rm -it)
+    _add_docker_args "$workspace" "$name"
+
+    cmd+=("$image")
+    _build_claude_cmd
+    if [[ ${#ca[@]} -gt 0 ]]; then _cmd_parts+=("${ca[@]}"); fi
+    cmd+=("${_cmd_parts[@]}")
+
+    _dim "→ Starting container: $name"
+    exec "${cmd[@]}"
+}
+
+_launch_docker_sandbox() {
+    # Legacy: Docker Desktop microVM sandbox (kept for users who have Docker Desktop)
+    local workspace="$1"; shift; local ca=("$@")
+    _require docker
+
+    local cmd=(docker sandbox run --workspace "$workspace" --credentials "$CLAUDE_SAFE_CREDENTIALS")
+
+    [[ -n "$CLAUDE_SAFE_TEMPLATE" ]] && cmd+=(-t "$CLAUDE_SAFE_TEMPLATE")
+
+    [[ "$CLAUDE_SAFE_DOCKER_SOCKET" == "true" ]] && cmd+=(--mount-docker-socket)
+    [[ "$CLAUDE_SAFE_DOCKER_SOCKET" == "proxy" ]] && \
+        _warn "Docker socket proxy mode not supported in Docker Desktop sandbox — skipping"
+
+    _add_volume_args
+
+    _build_claude_cmd
+    if [[ ${#ca[@]} -gt 0 ]]; then _cmd_parts+=("${ca[@]}"); fi
+    cmd+=("${_cmd_parts[@]}")
+
+    _dim "→ Starting sandbox: $(basename "$workspace")"
+    exec "${cmd[@]}"
+}
+
+_launch_none() {
+    local workspace="$1"; shift; cd "$workspace"
+    _build_claude_cmd
+    if [[ $# -gt 0 ]]; then _cmd_parts+=("$@"); fi
+    exec "${_cmd_parts[@]}"
+}
+
+_launch() {
+    local workspace="$1"; shift
+    case "$CLAUDE_SAFE_SANDBOX_MODE" in
+        docker)         _launch_docker "$workspace" "$@" ;;
+        docker-sandbox) _launch_docker_sandbox "$workspace" "$@" ;;
+        none)           _launch_none "$workspace" "$@" ;;
+        *) _error "Unknown mode: $CLAUDE_SAFE_SANDBOX_MODE"; exit 1 ;;
+    esac
+}
+
+# ─── Container-tmux session management ─────────────────────────────────────
+#
+# Architecture (Model A): tmux runs INSIDE the container.
+#   host → docker run -d (container with sleep infinity)
+#        → docker exec: tmux new-session → claude / bash panes
+#        ← docker exec: tmux attach (reattach after detach)
+#
+# All panes/windows are sandboxed. No host shell leakage.
+# Ctrl-b d detaches tmux → docker exec exits → host shell.
+# Container stays running. `claude-safe` again → reattaches.
+
+_tmux_running_in_container() {
+    # Check if tmux server is running inside a container
+    local name="$1"
+    docker exec "$name" tmux ls &>/dev/null
+}
+
+_create_session() {
+    local session="$1" workspace="$2"; shift 2; local ca=("$@")
+    local name; name="$(_container_name "$workspace")"
+
+    # Start container in background
+    _start_container "$workspace" "$name"
+    _auto_setup_container "$name" "$workspace"
+
+    # Check for Claude Code and script updates (non-blocking, skip on failure)
+    if [[ "$CLAUDE_SAFE_VERSION_CHECK" == "true" ]]; then
+        _check_claude_version "$name"
+        _check_script_version
+    fi
+
+    # Build claude command for the initial pane — use printf %q to prevent injection
+    _build_claude_cmd
+    if [[ ${#ca[@]} -gt 0 ]]; then _cmd_parts+=("${ca[@]}"); fi
+    local claude_cmd; claude_cmd="$(printf '%q ' "${_cmd_parts[@]}")"
+    claude_cmd="${claude_cmd% }"  # trim trailing space
+
+    # Wrap with notification on exit (bell for remote terminals)
+    if [[ -n "$CLAUDE_SAFE_NOTIFY_CMD" ]]; then
+        local _notify_parts; read -ra _notify_parts <<< "$CLAUDE_SAFE_NOTIFY_CMD"
+        local _notify_shell; _notify_shell="$(printf '%q ' "${_notify_parts[@]}")"
+        local _notify_msg; _notify_msg="$(printf '%q' "claude-safe: ${session} finished")"
+        claude_cmd="${claude_cmd}; ${_notify_shell}${_notify_msg}"
+    fi
+
+    _create_tmux_in_container "$name" "$session" "$workspace" "$claude_cmd"
+}
+
+_attach_session() {
+    # Attach to tmux session inside a running container
+    local name="$1" session="$2"
+    local tmux_args=()
+    [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]] \
+        && tmux_args+=(-f "$CLAUDE_SAFE_CONTAINER_TMUX_CONF")
+
+    # Attach to tmux (no exec — allows cleanup to run after detach)
+    docker exec -it "$name" tmux "${tmux_args[@]}" attach -t "$session"
+
+    # Auto-cleanup: if no tmux sessions remain, remove the container
+    if [[ "$CLAUDE_SAFE_AUTO_CLEANUP" == "true" ]]; then
+        if ! docker exec "$name" tmux list-sessions &>/dev/null; then
+            _info "No sessions remaining, cleaning up container..."
+            docker rm -f "$name" &>/dev/null
+            rm -f "${CLAUDE_HOME}/.credentials.json"
+        fi
+    fi
+}
+
+# ─── Installer ───────────────────────────────────────────────────────────────
+
+_ihead() { printf "\n${BOLD}%s${NC}\n" "$*"; }
+
+# Migrations: applied automatically to existing configs on every install/update.
+# Add an entry here whenever a config var is renamed, removed, or superseded.
+_migrate_config() {
+    local cfg="$1"
+    local changed=false
+
+    _cfg_del() {
+        local key="$1"
+        grep -q "^${key}=" "$cfg" || return 1
+        local tmp; tmp="$(mktemp)"
+        grep -v "^${key}=" "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+        _info "Migration: removed deprecated ${key}"
+        changed=true
+    }
+
+    _cfg_rename() {
+        local old="$1" new="$2"
+        grep -q "^${old}=" "$cfg" || return 1
+        local tmp; tmp="$(mktemp)"
+        sed "s|^${old}=|${new}=|" "$cfg" > "$tmp" && mv "$tmp" "$cfg"
+        _info "Migration: renamed ${old} → ${new}"
+        changed=true
+    }
+
+    _cfg_add_if_missing() {
+        local key="$1" val="$2"
+        grep -q "^${key}=" "$cfg" && return 0
+        echo "${key}=${val}" >> "$cfg"
+        _info "Migration: added ${key}=${val}"
+        changed=true
+    }
+
+    # ── Rename history ────────────────────────────────────────────────────────
+    # v0404304: CLAUDE_SAFE_CODE_DIR → CLAUDE_SAFE_RO_DIRS
+    _cfg_rename "CLAUDE_SAFE_CODE_DIR" "CLAUDE_SAFE_RO_DIRS"
+
+    # ── Removal history ───────────────────────────────────────────────────────
+    # v0404304: CLAUDE_SAFE_MOUNT_CODE superseded by CLAUDE_SAFE_RO_DIRS
+    _cfg_del "CLAUDE_SAFE_MOUNT_CODE"
+
+    # ── New vars (added with defaults if absent) ───────────────────────────────
+    # v05ba851: permission mode (default empty = normal prompts)
+    _cfg_add_if_missing "CLAUDE_SAFE_PERMISSION_MODE" '""'
+
+    # v9665332: direnv auto-allow (safe default inside containers)
+    _cfg_add_if_missing "CLAUDE_SAFE_DIRENV_AUTO_ALLOW" "true"
+
+    # SSH agent mode (default: agent — forward SSH_AUTH_SOCK, don't expose keys)
+    _cfg_add_if_missing "CLAUDE_SAFE_SSH_MODE" '"agent"'
+
+    # Setup hook confirmation (default: true — prompt before executing .cmux/setup)
+    _cfg_add_if_missing "CLAUDE_SAFE_SETUP_HOOK_CONFIRM" "true"
+
+    $changed
+}
+
+# Rebuild config.sh from config.example.sh, preserving user values.
+# New vars get example defaults + comments; removed vars are dropped.
+_rebuild_config() {
+    local cfg="$1" example="$2"
+
+    # Capture current user values (raw lines, preserving quotes/spaces)
+    declare -A user_vars
+    while IFS= read -r line; do
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        user_vars[$key]="$val"
+    done < <(grep '^CLAUDE_SAFE_[A-Z0-9_]*=' "$cfg")
+
+    declare -A example_vars
+    local new_vars=() removed_vars=()
+    local tmp; tmp="$(mktemp)"
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^(CLAUDE_SAFE_[A-Z0-9_]+)= ]]; then
+            local key="${BASH_REMATCH[1]}"
+            example_vars[$key]=1
+            if [[ -v "user_vars[$key]" ]]; then
+                echo "${key}=${user_vars[$key]}" >> "$tmp"
+            else
+                echo "$line" >> "$tmp"
+                new_vars+=("$key")
+            fi
+        else
+            echo "$line" >> "$tmp"
+        fi
+    done < "$example"
+
+    for key in "${!user_vars[@]}"; do
+        [[ -v "example_vars[$key]" ]] || removed_vars+=("$key")
+    done
+
+    for v in "${new_vars[@]}";     do _info "Config: added ${v}"; done
+    for v in "${removed_vars[@]}"; do _info "Config: removed deprecated ${v}"; done
+
+    if (( ${#new_vars[@]} + ${#removed_vars[@]} > 0 )) || ! diff -q "$cfg" "$tmp" >/dev/null 2>&1; then
+        mv "$tmp" "$cfg"
+        _info "Config updated: ${cfg}"
+    else
+        rm -f "$tmp"
+        _info "Config already up to date"
+    fi
+}
+
+# Apply renames/deletes then rebuild config from the example template.
+_update_config() {
+    local config_declarative="${CONFIG_DIR}/config"
+
+    if [[ -f "$config_declarative" ]]; then
+        # New declarative format: apply variable renames/deletes only (no rebuild needed)
+        _migrate_config "$config_declarative" || _info "Config is up to date"
+        return 0
+    fi
+
+    local cfg="$CONFIG_FILE"
+    local asset_dir; asset_dir="$(_asset_dir)"
+    local example="${asset_dir}/config.example.sh"
+    [[ -f "$example" ]] || example="${SELF%/*}/config.example.sh"
+
+    [[ -f "$cfg" ]]     || { _info "No config found — skipping migration (run install first)"; return 0; }
+    [[ -f "$example" ]] || { _info "config.example.sh not found — skipping config rebuild"; return 0; }
+
+    _migrate_config "$cfg" || true
+    _rebuild_config "$cfg" "$example"
+}
+
+_reconfigure_global_config() {
+    # Interactive wizard that writes ~/.config/claude-safe/config.
+    # Used by both `install` and `config --reconfigure`.
+    # Stores chosen install_bin in _RECONFIGURE_INSTALL_BIN for install to pick up.
+    local install_bin="${1:-${CLAUDE_SAFE_INSTALL_BIN:-$HOME/.local/bin/claude-safe}}"
+
+    # Core
+    _ihead "Core"
+    install_bin=$(_ask "Install location" "$install_bin")
+    _RECONFIGURE_INSTALL_BIN="$install_bin"
+    local permission_mode; permission_mode=$(_ask "Permission mode (bypass/\"\")" "${CLAUDE_SAFE_PERMISSION_MODE:-bypass}")
+    local network; network=$(_ask "Network mode (host/bridge)" "${CLAUDE_SAFE_NETWORK:-host}")
+    local tmux=false
+    if _ask_yn "Enable tmux (y=tmux session, n=direct attach)?" "${CLAUDE_SAFE_TMUX:-true}"; then
+        tmux=true
+    fi
+
+    # Mounts
+    _ihead "Mounts"
+    local default_ro=""
+    for _c in "$HOME/Code" "$HOME/Projects" "$HOME/src"; do
+        [[ -d "$_c" ]] && { default_ro="$_c"; break; }
+    done
+    local ro_dirs; ro_dirs=$(_ask "Read-only code dirs (colon-separated)" "${CLAUDE_SAFE_RO_DIRS:-$default_ro}")
+    local rw_dirs; rw_dirs=$(_ask "Read-write extra dirs (colon-separated, empty=none)" "${CLAUDE_SAFE_RW_DIRS:-}")
+
+    local mount_kube=false kube_profiles=""
+    if _ask_yn "Mount ~/.kube?" "${CLAUDE_SAFE_MOUNT_KUBE:-true}"; then
+        mount_kube=true
+        local _kube_contexts=""
+        command -v kubectl &>/dev/null && _kube_contexts="$(kubectl config get-contexts -o name 2>/dev/null | tr '\n' ' ')"
+        [[ -n "$_kube_contexts" ]] && _dim "Available contexts: ${_kube_contexts}"
+        kube_profiles=$(_ask "Kube profiles to expose (colon-separated, empty=all)" "${CLAUDE_SAFE_KUBE_PROFILES:-}")
+    fi
+
+    local mount_ssh=false ssh_mode="agent"
+    if _ask_yn "Mount ~/.ssh?" "${CLAUDE_SAFE_MOUNT_SSH:-true}"; then
+        mount_ssh=true
+        ssh_mode=$(_ask "SSH mode (agent/keys)" "${CLAUDE_SAFE_SSH_MODE:-agent}")
+    fi
+
+    local mount_gh=false
+    _ask_yn "Mount ~/.config/gh?" "${CLAUDE_SAFE_MOUNT_GH:-true}" && mount_gh=true || mount_gh=false
+
+    local mount_gitconfig=false
+    _ask_yn "Mount ~/.gitconfig?" "${CLAUDE_SAFE_MOUNT_GITCONFIG:-true}" && mount_gitconfig=true || mount_gitconfig=false
+
+    local mount_tailscale=false
+    _ask_yn "Mount Tailscale socket?" "${CLAUDE_SAFE_MOUNT_TAILSCALE:-false}" && mount_tailscale=true || mount_tailscale=false
+
+    local docker_socket=false docker_socket_confirm=false
+    if _ask_yn "Mount Docker socket?" "${CLAUDE_SAFE_DOCKER_SOCKET:-false}"; then
+        docker_socket=true
+        _ask_yn "Require confirmation before each use?" "${CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM:-false}" \
+            && docker_socket_confirm=true || docker_socket_confirm=false
+    fi
+
+    local direnv_auto_allow=false
+    _ask_yn "Auto-allow direnv in container?" "${CLAUDE_SAFE_DIRENV_AUTO_ALLOW:-false}" \
+        && direnv_auto_allow=true || direnv_auto_allow=false
+
+    # Advanced
+    _ihead "Advanced"
+    local host_env; host_env=$(_ask "Host env vars to forward (space-separated names, empty=none)" "${CLAUDE_SAFE_HOST_ENV:-}")
+    local extra_env; extra_env=$(_ask "Static env vars (KEY=VALUE space-separated, empty=none)" "${CLAUDE_SAFE_EXTRA_ENV:-}")
+    local claude_args; claude_args=$(_ask "Extra claude args (empty=none)" "${CLAUDE_SAFE_CLAUDE_ARGS:-}")
+    local notify_cmd; notify_cmd=$(_ask "Notify command on session exit (empty=none)" "${CLAUDE_SAFE_NOTIFY_CMD:-}")
+    local version_check; version_check=$(_ask "Check for Claude Code updates (true/false)" "${CLAUDE_SAFE_VERSION_CHECK:-true}")
+    local auto_cleanup; auto_cleanup=$(_ask "Remove container when last session exits (true/false)" "${CLAUDE_SAFE_AUTO_CLEANUP:-true}")
+
+    # tmux.conf
+    _ihead "Remote access"
+    local tmux_conf="${CLAUDE_SAFE_TMUX_CONF:-}"
+    local script_dir="${SELF%/*}"
+    local asset_dir; asset_dir="$(_asset_dir)"
+    local src_tmux="${asset_dir}/tmux.conf"
+    [[ -f "$src_tmux" ]] || src_tmux="$script_dir/tmux.conf"
+    [[ -f "$src_tmux" ]] || src_tmux="$PWD/tmux.conf"
+    if [[ -f "$src_tmux" ]] && [[ -z "$tmux_conf" ]]; then
+        if _ask_yn "Install tmux.conf for remote sessions?" "y"; then
+            mkdir -p "$CONFIG_DIR"
+            cp "$src_tmux" "$CONFIG_DIR/tmux.conf"
+            tmux_conf="$CONFIG_DIR/tmux.conf"
+            _info "Copied tmux.conf → $CONFIG_DIR/tmux.conf"
+        fi
+    elif [[ -n "$tmux_conf" ]]; then
+        _dim "tmux.conf: $tmux_conf (keep or clear to unset)"
+        local new_tmux_conf; new_tmux_conf=$(_ask "tmux.conf path" "$tmux_conf")
+        tmux_conf="$new_tmux_conf"
+    fi
+
+    # Write config
+    _ihead "Writing config"
+    mkdir -p "$CONFIG_DIR"
+    local config_out="${CONFIG_DIR}/config"
+    cat > "$config_out" <<CONF
+# ~/.config/claude-safe/config
+# Generated by claude-safe on $(date -u +%Y-%m-%dT%H:%M:%SZ)
+
+# ── Core ─────────────────────────────────────────────────────────────────────
+CLAUDE_SAFE_PERMISSION_MODE=${permission_mode}
+CLAUDE_SAFE_NETWORK=${network}
+CLAUDE_SAFE_TMUX=${tmux}
+
+# ── Mounts ───────────────────────────────────────────────────────────────────
+CLAUDE_SAFE_RO_DIRS=${ro_dirs}
+CONF
+    [[ -n "$rw_dirs" ]]                 && echo "CLAUDE_SAFE_RW_DIRS=${rw_dirs}"                 >> "$config_out"
+    [[ "$mount_kube" == "false" ]]      && echo "CLAUDE_SAFE_MOUNT_KUBE=false"                   >> "$config_out"
+    [[ -n "$kube_profiles" ]]           && echo "CLAUDE_SAFE_KUBE_PROFILES=${kube_profiles}"     >> "$config_out"
+    [[ "$mount_ssh" == "false" ]]       && echo "CLAUDE_SAFE_MOUNT_SSH=false"                    >> "$config_out"
+    [[ "$mount_ssh" == "true" ]] && [[ "$ssh_mode" != "agent" ]] \
+                                        && echo "CLAUDE_SAFE_SSH_MODE=${ssh_mode}"               >> "$config_out"
+    [[ "$mount_gh" == "false" ]]        && echo "CLAUDE_SAFE_MOUNT_GH=false"                     >> "$config_out"
+    [[ "$mount_gitconfig" == "false" ]] && echo "CLAUDE_SAFE_MOUNT_GITCONFIG=false"              >> "$config_out"
+    [[ "$mount_tailscale" == "true" ]]  && echo "CLAUDE_SAFE_MOUNT_TAILSCALE=true"               >> "$config_out"
+    [[ "$docker_socket" == "true" ]]    && echo "CLAUDE_SAFE_DOCKER_SOCKET=true"                 >> "$config_out"
+    [[ "$docker_socket_confirm" == "true" ]] \
+                                        && echo "CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM=true"         >> "$config_out"
+    [[ "$direnv_auto_allow" == "true" ]] \
+                                        && echo "CLAUDE_SAFE_DIRENV_AUTO_ALLOW=true"             >> "$config_out"
+    [[ -n "$tmux_conf" ]]               && echo "CLAUDE_SAFE_TMUX_CONF=${tmux_conf}"             >> "$config_out"
+    [[ -n "$host_env" ]]                && echo "CLAUDE_SAFE_HOST_ENV=${host_env}"               >> "$config_out"
+    [[ -n "$extra_env" ]]               && echo "CLAUDE_SAFE_EXTRA_ENV=${extra_env}"             >> "$config_out"
+    [[ -n "$claude_args" ]]             && echo "CLAUDE_SAFE_CLAUDE_ARGS=${claude_args}"         >> "$config_out"
+    [[ -n "$notify_cmd" ]]              && echo "CLAUDE_SAFE_NOTIFY_CMD=${notify_cmd}"           >> "$config_out"
+    [[ "$version_check" != "true" ]]    && echo "CLAUDE_SAFE_VERSION_CHECK=${version_check}"     >> "$config_out"
+    [[ "$auto_cleanup" != "true" ]]     && echo "CLAUDE_SAFE_AUTO_CLEANUP=${auto_cleanup}"       >> "$config_out"
+    chmod 600 "$config_out"
+    _info "Config written to $config_out"
+}
+
+cmd_install() {
+    local script_dir="${SELF%/*}"
+
+    # Preflight
+    _ihead "Preflight checks"
+    command -v docker &>/dev/null || { _error "Docker not found. Install OrbStack, Colima, or Docker Desktop first."; exit 1; }
+    _info "Docker: $(docker --version | head -1)"
+    local _creds_store; _creds_store="$(_detect_creds_store || true)"
+    if [[ -n "$_creds_store" ]]; then
+        if command -v "docker-credential-${_creds_store}" &>/dev/null; then
+            _info "docker-credential-${_creds_store}: found"
+        else
+            _warn "docker-credential-${_creds_store} not found (required by ~/.docker/config.json)"
+            command -v brew &>/dev/null \
+                && _info "Install: brew install docker-credential-helper"
+        fi
+    fi
+    command -v git &>/dev/null || { _error "Git not found."; exit 1; }
+    _info "Git found"
+    [[ "${BASH_VERSINFO[0]:-0}" -ge 4 ]] || { _error "Bash 4+ required (found $BASH_VERSION)"; exit 1; }
+    _info "Bash $BASH_VERSION"
+    [[ -d "$HOME/.claude" ]] || _warn "~/.claude not found — install Claude Code first"
+
+    # Detect existing config + migrate
+    _ihead "Existing configuration"
+    local skip_config=false
+    local existing_config=""
+    local config_declarative="${CONFIG_DIR}/config"
+    if [[ -f "$config_declarative" ]]; then
+        existing_config="$config_declarative"
+    elif [[ -f "$CONFIG_FILE" ]]; then
+        existing_config="$CONFIG_FILE"
+    fi
+    if [[ -n "$existing_config" ]]; then
+        _info "Found existing config: $existing_config"
+        # Always migrate first (rename/remove/add deprecated vars)
+        _ihead "Migrating config"
+        if _migrate_config "$existing_config"; then
+            _info "Config updated"
+        else
+            _info "Config already up to date"
+        fi
+        if _ask_yn "Reconfigure interactively (current values become defaults)?" "n"; then
+            # shellcheck source=/dev/null
+            [[ "$existing_config" == "$CONFIG_FILE" ]] && source "$existing_config" \
+                || _parse_config "$existing_config" false
+            _info "Loaded existing config as defaults"
+        else
+            _info "Keeping existing config."
+            skip_config=true
+        fi
+    else
+        _info "No existing config — starting fresh"
+    fi
+
+    local install_bin="${CLAUDE_SAFE_INSTALL_BIN:-$HOME/.local/bin/claude-safe}"
+
+    if [[ "$skip_config" == false ]]; then
+        _reconfigure_global_config "$install_bin"
+        install_bin="${_RECONFIGURE_INSTALL_BIN:-$install_bin}"
+    fi
+
+    # Install script
+    _ihead "Installing script"
+    local install_dir; install_dir="$(dirname "$install_bin")"
+    mkdir -p "$install_dir"
+    cp "$SELF" "$install_bin"
+    chmod +x "$install_bin"
+    _info "Installed → $install_bin"
+    command -v claude-safe &>/dev/null || _warn "$install_dir is not in PATH — add to your shell profile: export PATH=\"$install_dir:\$PATH\""
+
+    # Clone asset repo (for installed users without a checkout)
+    _ihead "Asset repository"
+    _ensure_asset_repo || true
+
+    # Pull or build image
+    _ihead "Docker image"
+    local image; image="$(_resolve_image)"
+    if _is_custom_template; then
+        # Custom template or build mode — offer to build
+        local dockerfile; dockerfile="$(_find_dockerfile)"
+        if [[ -f "$dockerfile" ]]; then
+            if _ask_yn "Build ${image} image now?" "y"; then
+                _pull_base_image "$dockerfile"
+                _docker_build -t "$image" -f "$dockerfile" "$(dirname "$dockerfile")"
+                mkdir -p "${CONFIG_DIR}" && date +%s > "${CONFIG_DIR}/.last-update"
+                _info "Image built: ${image}"
+            else
+                _warn "Skipped. Build later: docker build -t ${image} -f Dockerfile.claude-safe ."
+            fi
+        else
+            _warn "Dockerfile.claude-safe not found — build manually from the repo directory"
+        fi
+    else
+        # Default: pull from GHCR
+        if _ask_yn "Pull ${image} now?" "y"; then
+            if docker pull "$image"; then
+                mkdir -p "${CONFIG_DIR}" && date +%s > "${CONFIG_DIR}/.last-update"
+                _info "Image pulled: ${image}"
+            else
+                _warn "Pull failed — run 'claude-safe update' to retry"
+            fi
+        else
+            _warn "Skipped. Pull later: claude-safe update"
+        fi
+    fi
+
+    # Verify
+    _ihead "Verifying installation"
+    if command -v claude-safe &>/dev/null; then
+        claude-safe doctor
+    else
+        "$install_bin" doctor
+    fi
+
+    echo -e "\n${GREEN}${BOLD}✓ Install complete.${NC} Run ${CYAN}claude-safe${NC} in any project directory to get started."
+    echo -e "${DIM}Tip: run ${NC}${CYAN}claude-safe config --reconfigure${NC}${DIM} to adjust mounts, env, Docker socket, and other advanced options.${NC}\n"
+}
+
+# ─── Subcommands ─────────────────────────────────────────────────────────────
+
+_find_dockerfile() {
+    local d="${SELF%/*}/Dockerfile.claude-safe"
+    [[ -f "$d" ]] && { echo "$d"; return 0; }
+    _ensure_asset_repo 2>/dev/null
+    local asset_dir; asset_dir="$(_asset_dir)"
+    d="${asset_dir}/Dockerfile.claude-safe"
+    [[ -f "$d" ]] && { echo "$d"; return 0; }
+    echo "$PWD/Dockerfile.claude-safe"
+}
+
+_attach_or_create() {
+    local name="$1" session="$2" workspace="$3" label="$4"; shift 4
+    if _container_running "$name" && _tmux_running_in_container "$name"; then
+        _info "Reattaching: ${CYAN}${session}${NC}"
+        _attach_session "$name" "$session"
+    else
+        _info "${label}: ${CYAN}${session}${NC}"
+        _create_session "$session" "$workspace" "$@"
+        _attach_session "$name" "$session"
+    fi
+}
+
+cmd_new() {
+    local branch="${1:?Usage: $SCRIPT_NAME new <branch> [prompt]}"; shift
+    _require git docker
+
+    local root wt_path session
+    root="$(_repo_root)"; branch="$(_sanitize_branch "$branch")"
+    wt_path="$(_worktree_path "$branch")"; session="$(_session_name "$branch")"
+
+    if [[ ! -d "$wt_path" ]]; then
+        _info "Worktree: ${CYAN}${branch}${NC}"
+        mkdir -p "$(dirname "$wt_path")"
+        git -C "$root" worktree add "$wt_path" -b "$branch" 2>/dev/null \
+            || git -C "$root" worktree add "$wt_path" "$branch" 2>/dev/null \
+            || { _error "Failed: $branch"; exit 1; }
+    fi
+
+    _auto_setup_host "$wt_path" "$root"
+
+    if [[ "$CLAUDE_SAFE_TMUX" != "true" ]]; then
+        _launch "$wt_path" "$@"
+        return
+    fi
+
+    local name; name="$(_container_name "$wt_path")"
+
+    # If container+tmux already running, just reattach
+    _attach_or_create "$name" "$session" "$wt_path" "Session" "$@"
+}
+
+cmd_start() {
+    local branch="${1:?Usage: $SCRIPT_NAME start <branch>}"; shift
+    local wt_path; wt_path="$(_worktree_path "$branch")"
+    local session; session="$(_session_name "$branch")"
+    local name; name="$(_container_name "$wt_path")"
+    [[ -d "$wt_path" ]] || { _error "No worktree: $branch"; exit 1; }
+
+    if [[ "$CLAUDE_SAFE_TMUX" != "true" ]]; then
+        _launch "$wt_path" "$@"
+        return
+    fi
+
+    _attach_or_create "$name" "$session" "$wt_path" "Starting" "$@"
+}
+
+cmd_shell() {
+    local wt_path="${1:-$PWD}"
+    [[ -n "${1:-}" ]] && wt_path="$(_worktree_path "$1")"
+    [[ -d "$wt_path" ]] || { _error "Not found: $wt_path"; exit 1; }
+
+    local name; name="$(_container_name "$wt_path")"
+    if _container_running "$name"; then
+        _dim "→ shell into container: $name"
+        exec docker exec -it -w "$wt_path" "$name" zsh -l
+    else
+        _dim "→ starting ephemeral container"
+        local image; image="$(_resolve_image)"
+        _inject_keychain_creds || true
+        _prepare_cow_staging
+        _maybe_update_image "$image"
+        local cmd=(docker run --rm -it)
+        _add_docker_args "$wt_path" "${name}-shell"
+        cmd+=("$image" zsh -l)
+        exec "${cmd[@]}"
+    fi
+}
+
+cmd_ls() {
+    local root wt_dir
+    root="$(_repo_root 2>/dev/null)" || root="$PWD"
+    wt_dir="${root}/${CLAUDE_SAFE_WORKTREE_DIR}"
+
+    echo -e "\n${BOLD}  Worktrees${NC}  ${DIM}${wt_dir}${NC}\n"
+    if [[ -d "$wt_dir" ]] && ls "$wt_dir" &>/dev/null; then
+        for d in "$wt_dir"/*/; do
+            [[ -d "$d" ]] || continue
+            local b gs cname status; b="$(basename "$d")"
+            cname="$(_container_name "$d")"
+            if _container_running "$cname"; then
+                status="${GREEN}● running${NC}"
+            else
+                status="${DIM}○ stopped${NC}"
+            fi
+            gs="$(cd "$d" && git log --oneline -1 2>/dev/null | head -c 60)"
+            echo -e "  ${status}  ${CYAN}${b}${NC}  ${DIM}${cname}${NC}"
+            [[ -n "$gs" ]] && _dim "     ${gs}"
+        done
+    else
+        _dim "  None."
+    fi
+
+    # Show all claude-safe containers and their tmux sessions
+    if command -v docker &>/dev/null; then
+        echo -e "\n${BOLD}  Containers${NC}  ${DIM}(claude-safe=true)${NC}\n"
+        local cids
+        cids="$(docker ps --filter 'label=claude-safe=true' --format '{{.Names}}' 2>/dev/null)"
+        if [[ -n "$cids" ]]; then
+            while IFS= read -r cname; do
+                local cstatus; cstatus="$(docker inspect -f '{{.State.Status}}' "$cname" 2>/dev/null)"
+                local workspace; workspace="$(docker inspect -f '{{index .Config.Labels "claude-safe.workspace"}}' "$cname" 2>/dev/null)"
+                echo -e "  ${GREEN}●${NC} ${CYAN}${cname}${NC}  ${DIM}${workspace}${NC}"
+                # List tmux sessions inside this container (only when tmux is enabled)
+                if [[ "$CLAUDE_SAFE_TMUX" == "true" ]]; then
+                    local tsessions
+                    tsessions="$(docker exec "$cname" tmux ls 2>/dev/null)" && {
+                        while IFS= read -r ts; do
+                            echo -e "    ${DIM}└ ${ts}${NC}"
+                        done <<< "$tsessions"
+                    }
+                fi
+            done <<< "$cids"
+        else
+            _dim "  None."
+        fi
+    fi
+    echo ""
+}
+
+cmd_merge() {
+    local branch
+    [[ -n "${1:-}" ]] && branch="$(_sanitize_branch "$1")" || { _is_in_worktree && branch="$(_current_worktree_branch)" || { _error "Usage: $SCRIPT_NAME merge <branch>"; exit 1; }; }
+    local squash=false; [[ "${2:-}" == "--squash" ]] && squash=true
+    [[ -d "$(_worktree_path "$branch")" ]] || { _error "No worktree: $branch"; exit 1; }
+    cd "$(_repo_root)"
+    _info "Merge: ${CYAN}${branch}${NC}"
+    [[ "$squash" == "true" ]] && { git merge --squash "$branch"; _info "Squash staged."; } || git merge "$branch"
+    _notify "Merged: $branch"
+}
+
+cmd_rm() {
+    local branch
+    [[ -n "${1:-}" ]] && branch="$(_sanitize_branch "$1")" || { _is_in_worktree && branch="$(_current_worktree_branch)" || { _error "Usage: $SCRIPT_NAME rm <branch>"; exit 1; }; }
+    local root="$(_repo_root)" wt_path="$(_worktree_path "$branch")"
+    # Stop container (kills tmux inside it)
+    local cname; cname="$(_container_name "$wt_path")"
+    _stop_container "$cname" && _info "Stopped: $cname"
+    [[ -d "$wt_path" ]] && { cd "$root"; git worktree remove --force "$wt_path" 2>/dev/null || rm -rf "$wt_path"; _info "Removed worktree: $branch"; }
+    git -C "$root" branch -d "$branch" 2>/dev/null && _info "Branch deleted: $branch" || true
+}
+
+cmd_stop() {
+    local workspace
+    if [[ -n "${1:-}" ]]; then
+        workspace="$(_worktree_path "$1")"
+    else
+        workspace="$PWD"
+    fi
+    local name; name="$(_container_name "$workspace")"
+    _stop_container "$name" && _info "Stopped: $name" || _dim "No running container for ${workspace}"
+}
+
+
+cmd_dash() { cmd_ls; }
+
+cmd_auto() {
+    # Smart entry point: detect existing container, reattach or create.
+    _require docker
+
+    if [[ "$CLAUDE_SAFE_TMUX" != "true" ]]; then
+        _launch "$PWD" "$@"
+        return
+    fi
+
+    local workspace="$PWD"
+    local name; name="$(_container_name "$workspace")"
+
+    # Container already running with tmux inside?
+    if _container_running "$name" && _tmux_running_in_container "$name"; then
+        # Get first tmux session name
+        local session
+        session="$(docker exec "$name" tmux ls -F '#{session_name}' 2>/dev/null | head -1)"
+        if [[ -n "$session" ]]; then
+            _info "Reattaching: ${CYAN}${session}${NC} in ${DIM}${name}${NC}"
+            _attach_session "$name" "$session"
+            return
+        fi
+    fi
+
+    # Container running but no tmux? Create session inside it.
+    if _container_running "$name"; then
+        local session="${CLAUDE_SAFE_TMUX_PREFIX}-$(basename "$workspace")"
+        _info "New session in running container: ${CYAN}${session}${NC}"
+
+        _build_claude_cmd
+        if [[ $# -gt 0 ]]; then _cmd_parts+=("$@"); fi
+        local claude_cmd; claude_cmd="$(printf '%q ' "${_cmd_parts[@]}")"
+        claude_cmd="${claude_cmd% }"
+
+        _create_tmux_in_container "$name" "$session" "$workspace" "$claude_cmd"
+        _attach_session "$name" "$session"
+        return
+    fi
+
+    # No container → create everything fresh
+    local session="${CLAUDE_SAFE_TMUX_PREFIX}-$(basename "$workspace")"
+    _info "New session: ${CYAN}${session}${NC}"
+    _create_session "$session" "$workspace" "$@"
+    _attach_session "$name" "$session"
+}
+
+cmd_tmux() {
+    CLAUDE_SAFE_TMUX=true
+    cmd_auto "$@"
+}
+
+cmd_direct() {
+    _require docker
+    _launch "$PWD" "$@"
+}
+
+cmd_update() {
+    # Update the Docker image (pull from GHCR or build locally) and self-update the script.
+    # Usage: update [--build] [--skip-script] [--skip-assets]
+    _require docker
+    local build_flag=false skip_script=false skip_assets=false
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            --build)        build_flag=true ;;
+            --skip-script)  skip_script=true ;;
+            --skip-assets)  skip_assets=true ;;
+            *) _error "Unknown option: $1"; return 1 ;;
+        esac
+        shift
+    done
+
+    local stamp_file="${CONFIG_DIR}/.last-update"
+    # One-time migration: rename old stamp file
+    [[ -f "${CONFIG_DIR}/.last-build" ]] && [[ ! -f "$stamp_file" ]] \
+        && mv "${CONFIG_DIR}/.last-build" "$stamp_file"
+    mkdir -p "${CONFIG_DIR}"
+
+    # Step 1: Script self-update from GitHub Releases
+    if [[ "$skip_script" == "false" ]]; then
+        _self_update || true
+    fi
+
+    # Step 2: Asset repo sync (Dockerfile, config.example, tmux.conf)
+    if [[ "$skip_assets" == "false" ]]; then
+        _update_assets || true
+    fi
+
+    # Step 3: Image update
+    local image; image="$(_resolve_image)"
+    if [[ "$build_flag" == "true" ]] || _is_custom_template; then
+        # Local build (forced or custom template)
+        local dockerfile; dockerfile="$(_find_dockerfile)"
+        [[ -f "$dockerfile" ]] || { _error "Dockerfile.claude-safe not found"; return 1; }
+        local build_args=(-f "$dockerfile" -t "$image" --build-arg "CLAUDE_CODE_CACHEBUST=$(date +%s)" "$(dirname "$dockerfile")")
+        _info "Building image: ${CYAN}${image}${NC}"
+        _pull_base_image "$dockerfile"
+        if _docker_build "${build_args[@]}"; then
+            date +%s > "$stamp_file"
+            _info "Image built: ${CYAN}${image}${NC}"
+        else
+            _error "Image build failed"
+            return 1
+        fi
+    else
+        # Pull from GHCR
+        _info "Pulling image: ${CYAN}${image}${NC}"
+        if docker pull "$image"; then
+            date +%s > "$stamp_file"
+            _info "Image updated: ${CYAN}${image}${NC}"
+        else
+            _error "Image pull failed"
+            return 1
+        fi
+    fi
+
+    _update_config
+}
+
+_cfg_src() {
+    # Print colored source label for a config variable: (override), (global), or (default).
+    local var="$1"
+    if [[ -n "${_OVERRIDE_FILE:-}" ]] && grep -q "^[[:space:]]*${var}=" "$_OVERRIDE_FILE" 2>/dev/null; then
+        printf '%b(override)%b' "$YELLOW" "$NC"
+    elif [[ -n "${_GLOBAL_CONFIG_FILE:-}" ]] && grep -q "^[[:space:]]*${var}=" "$_GLOBAL_CONFIG_FILE" 2>/dev/null; then
+        printf '%b(global)%b' "$DIM" "$NC"
+    else
+        printf '%b(default)%b' "$DIM" "$NC"
+    fi
+}
+
+_convert_config_sh() {
+    # Convert legacy config.sh (bash) to new declarative config format.
+    local old="${CONFIG_DIR}/config.sh" new="${CONFIG_DIR}/config"
+    if [[ ! -f "$old" ]]; then
+        _info "No config.sh to migrate."; return 0; fi
+    if [[ -f "$new" ]]; then
+        _warn "Both config.sh and config exist. Edit $new directly."; return 1; fi
+    {
+        echo "# Migrated from config.sh on $(date +%Y-%m-%d)"
+        echo "# Review and delete config.sh when satisfied."
+        echo ""
+        grep -E '^[[:space:]]*CLAUDE_SAFE_[A-Z_]+=' "$old" | sed 's/^[[:space:]]*//'
+    } > "$new"
+    chmod 600 "$new"
+    _info "Created: $new"
+    _info "Review it, then delete config.sh"
+}
+
+cmd_config() {
+    case "${1:-}" in
+        --migrate) _convert_config_sh; return ;;
+        --reconfigure)
+            local cfg="${_GLOBAL_CONFIG_FILE:-${CONFIG_DIR}/config}"
+            if [[ -f "$cfg" ]]; then
+                _info "Loading existing config as defaults: $cfg"
+                _parse_config "$cfg" false
+            fi
+            _reconfigure_global_config
+            return ;;
+    esac
+
+    cat << EOF
+
+${BOLD}claude-safe v${CLAUDE_SAFE_VERSION}${NC}
+  Config:   ${_GLOBAL_CONFIG_FILE:-<none>}
+  Override: ${_OVERRIDE_FILE:-<none>}
+
+${BOLD}Sandbox${NC}
+  MODE             ${CLAUDE_SAFE_SANDBOX_MODE}  $(_cfg_src CLAUDE_SAFE_SANDBOX_MODE)
+  TEMPLATE         ${CLAUDE_SAFE_TEMPLATE:-<default: GHCR>}  $(_cfg_src CLAUDE_SAFE_TEMPLATE)
+  IMAGE_MODE       ${CLAUDE_SAFE_IMAGE_MODE:-<default: pull>}  $(_cfg_src CLAUDE_SAFE_IMAGE_MODE)
+  Resolved image:  $(_resolve_image)
+  BUILD_INTERVAL   ${CLAUDE_SAFE_BUILD_INTERVAL}s   ${DIM}(0=always, -1=never)${NC}  $(_cfg_src CLAUDE_SAFE_BUILD_INTERVAL)
+  NETWORK          ${CLAUDE_SAFE_NETWORK}  $(_cfg_src CLAUDE_SAFE_NETWORK)
+  CREDENTIALS      ${CLAUDE_SAFE_CREDENTIALS}  $(_cfg_src CLAUDE_SAFE_CREDENTIALS)
+
+${BOLD}Mounts${NC}                                     ${BOLD}~/.claude/ detail${NC}
+  ~/.claude/       ${CLAUDE_SAFE_MOUNT_CLAUDE}  (granular)  $(_cfg_src CLAUDE_SAFE_MOUNT_CLAUDE)    ${DIM}RO: settings.json CLAUDE.md commands/${NC}
+  ~/.kube/         ${CLAUDE_SAFE_MOUNT_KUBE}  profiles: ${CLAUDE_SAFE_KUBE_PROFILES:-<all>}  $(_cfg_src CLAUDE_SAFE_MOUNT_KUBE)
+  ~/.ssh/          ${CLAUDE_SAFE_MOUNT_SSH}  (${CLAUDE_SAFE_SSH_MODE})  $(_cfg_src CLAUDE_SAFE_MOUNT_SSH)    ${DIM}    skills/ agents/ .credentials.json${NC}
+  ~/.gitconfig     ${CLAUDE_SAFE_MOUNT_GITCONFIG}  (ro)  $(_cfg_src CLAUDE_SAFE_MOUNT_GITCONFIG)    ${DIM}RW: projects/ plans/ todos/ file-history/${NC}
+  ~/.config/gh/    ${CLAUDE_SAFE_MOUNT_GH}  (ro)  $(_cfg_src CLAUDE_SAFE_MOUNT_GH)    ${DIM}    session-env/ debug/ statsig/${NC}
+  Tailscale        ${CLAUDE_SAFE_MOUNT_TAILSCALE}  $(_cfg_src CLAUDE_SAFE_MOUNT_TAILSCALE)    ${DIM}    ide/ telemetry/ teams/ history.jsonl${NC}
+  Docker socket    ${CLAUDE_SAFE_DOCKER_SOCKET}  confirm: ${CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM}  $(_cfg_src CLAUDE_SAFE_DOCKER_SOCKET)   ${DIM}    stats-cache.json shell-snapshots/${NC}
+  RO dirs          ${CLAUDE_SAFE_RO_DIRS:-<none>}  $(_cfg_src CLAUDE_SAFE_RO_DIRS)
+  RW dirs          ${CLAUDE_SAFE_RW_DIRS:-<none>}  $(_cfg_src CLAUDE_SAFE_RW_DIRS)
+  DIRENV_AUTO_ALLOW  ${CLAUDE_SAFE_DIRENV_AUTO_ALLOW}  $(_cfg_src CLAUDE_SAFE_DIRENV_AUTO_ALLOW)
+
+${BOLD}Worktree + tmux${NC}                            ${BOLD}Remote / iPad${NC}
+  TMUX             ${CLAUDE_SAFE_TMUX}  $(_cfg_src CLAUDE_SAFE_TMUX)    TMUX_CONF   ${CLAUDE_SAFE_TMUX_CONF:-<default>}  $(_cfg_src CLAUDE_SAFE_TMUX_CONF)
+  WORKTREE_DIR     ${CLAUDE_SAFE_WORKTREE_DIR}  $(_cfg_src CLAUDE_SAFE_WORKTREE_DIR)    NOTIFY      ${CLAUDE_SAFE_NOTIFY_CMD:-<none>}  $(_cfg_src CLAUDE_SAFE_NOTIFY_CMD)
+  TMUX_PREFIX      ${CLAUDE_SAFE_TMUX_PREFIX}  $(_cfg_src CLAUDE_SAFE_TMUX_PREFIX)
+  SETUP_HOOK       ${CLAUDE_SAFE_SETUP_HOOK}  confirm: ${CLAUDE_SAFE_SETUP_HOOK_CONFIRM}  $(_cfg_src CLAUDE_SAFE_SETUP_HOOK)
+  CLAUDE_ARGS      ${CLAUDE_SAFE_CLAUDE_ARGS:-<none>}  $(_cfg_src CLAUDE_SAFE_CLAUDE_ARGS)
+  PERMISSION_MODE  ${CLAUDE_SAFE_PERMISSION_MODE:-<none>}  $(_cfg_src CLAUDE_SAFE_PERMISSION_MODE)
+  AUTO_CLEANUP     ${CLAUDE_SAFE_AUTO_CLEANUP}  $(_cfg_src CLAUDE_SAFE_AUTO_CLEANUP)   ${DIM}(remove container when last session exits)${NC}
+  VERSION_CHECK    ${CLAUDE_SAFE_VERSION_CHECK}  $(_cfg_src CLAUDE_SAFE_VERSION_CHECK)   ${DIM}(warn if Claude Code version is outdated)${NC}
+
+${BOLD}Environment${NC}
+  HOST_ENV         ${CLAUDE_SAFE_HOST_ENV:-<none>}  $(_cfg_src CLAUDE_SAFE_HOST_ENV)   ${DIM}(forwarded from host at runtime)${NC}
+  EXTRA_ENV        ${CLAUDE_SAFE_EXTRA_ENV:-<none>}  $(_cfg_src CLAUDE_SAFE_EXTRA_ENV)   ${DIM}(static key=value)${NC}
+
+EOF
+}
+
+_generate_override_template() {
+    cat << 'TMPL'
+# .claude-safe/config — per-project override
+# Format: KEY=VALUE (declarative, no shell eval)
+# Only CLAUDE_SAFE_* keys are recognized. $HOME and ~/ are expanded.
+# CLAUDE_SAFE_NOTIFY_CMD is ignored here (global config only, for security).
+# Commit this file — it contains no credentials or executable code.
+
+# ── Sandbox ──────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_NETWORK=host
+# CLAUDE_SAFE_SANDBOX_MODE=docker
+# CLAUDE_SAFE_IMAGE_MODE=           # set to "build" to force local Docker builds
+
+# ── Mounts ───────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_MOUNT_KUBE=true
+# CLAUDE_SAFE_KUBE_PROFILES=
+# CLAUDE_SAFE_MOUNT_SSH=true
+# CLAUDE_SAFE_SSH_MODE=agent
+# CLAUDE_SAFE_RO_DIRS=$HOME/Code
+# CLAUDE_SAFE_RW_DIRS=
+# CLAUDE_SAFE_MOUNT_GITCONFIG=true
+# CLAUDE_SAFE_MOUNT_GH=true
+# CLAUDE_SAFE_MOUNT_TAILSCALE=false
+# CLAUDE_SAFE_DOCKER_SOCKET=false
+# CLAUDE_SAFE_DIRENV_AUTO_ALLOW=false
+# CLAUDE_SAFE_EXTRA_VOLUMES=
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_HOST_ENV=
+# CLAUDE_SAFE_EXTRA_ENV=
+
+# ── Resources ────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_MEMORY=
+# CLAUDE_SAFE_CPUS=
+
+# ── Worktree + tmux ───────────────────────────────────────────────────────────
+# CLAUDE_SAFE_TMUX=true
+# CLAUDE_SAFE_WORKTREE_DIR=.worktrees
+# CLAUDE_SAFE_TMUX_PREFIX=cs
+# CLAUDE_SAFE_SETUP_HOOK=.cmux/setup
+# CLAUDE_SAFE_SETUP_HOOK_CONFIRM=true
+
+# ── Claude ───────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_PERMISSION_MODE=
+# CLAUDE_SAFE_CLAUDE_ARGS=
+# CLAUDE_SAFE_VERSION_CHECK=true
+# CLAUDE_SAFE_AUTO_CLEANUP=true
+TMPL
+}
+
+cmd_custom() {
+    local subcmd="${1:-}"
+    local project_root; project_root="$(_repo_root 2>/dev/null)" || {
+        _error "Not in a git repository"; return 1; }
+    local override_file="${project_root}/.claude-safe/config"
+
+    case "$subcmd" in
+        --list|-l)
+            if [[ ! -f "$_TRUSTED_FILE" ]]; then
+                _info "No trusted project overrides."
+            else
+                echo -e "\n${BOLD}Trusted project overrides:${NC}"
+                while IFS= read -r p; do
+                    [[ -z "$p" ]] && continue
+                    if [[ -f "$p" ]]; then
+                        echo -e "  ${GREEN}✓${NC} $p"
+                    else
+                        echo -e "  ${DIM}✗ $p (file not found)${NC}"
+                    fi
+                done < "$_TRUSTED_FILE"
+                echo ""
+            fi
+            ;;
+        --path|-p)
+            echo "$override_file"
+            ;;
+        --rm)
+            if [[ -f "$override_file" ]]; then
+                rm -f "$override_file"
+                _info "Removed: $override_file"
+                rmdir "$(dirname "$override_file")" 2>/dev/null || true
+            else
+                _warn "No override file found: $override_file"
+            fi
+            _untrust_override "$override_file"
+            _info "Untrusted: $override_file"
+            ;;
+        "")
+            mkdir -p "$(dirname "$override_file")"
+            if [[ ! -f "$override_file" ]]; then
+                _generate_override_template > "$override_file"
+                chmod 644 "$override_file"
+                _info "Created: $override_file"
+            fi
+            _trust_override "$override_file"
+            _info "Trusted: $override_file"
+            local editor="${EDITOR:-vi}"
+            "$editor" "$override_file"
+            ;;
+        *)
+            _error "Unknown option: $subcmd"
+            echo "Usage: claude-safe custom [--list|--path|--rm]"
+            return 1
+            ;;
+    esac
+}
+
+cmd_doctor() {
+    echo -e "\n${BOLD}claude-safe doctor${NC}\n"
+    local ok=0 w=0 f=0
+    _ck()  { local label="${@: -1}"; "$@" &>/dev/null && { echo -e "  ${GREEN}✓${NC} $label"; ok=$((ok+1)); } || { echo -e "  ${RED}✗${NC} $label"; f=$((f+1)); }; }
+    _ckw() { local label="${@: -1}"; "$@" &>/dev/null && { echo -e "  ${GREEN}✓${NC} $label"; ok=$((ok+1)); } || { echo -e "  ${YELLOW}?${NC} $label ${DIM}(optional)${NC}"; w=$((w+1)); }; }
+
+    _ck command -v git; _ck command -v docker
+    _ckw command -v claude; _ckw command -v mosh-server
+    _ckw command -v kubectl; _ckw command -v helm; _ckw command -v k9s
+    echo ""
+    [[ -n "${_GLOBAL_CONFIG_FILE:-}" ]]  && echo -e "  ${GREEN}✓${NC} Config: ${_GLOBAL_CONFIG_FILE}" || echo -e "  ${YELLOW}?${NC} No config"
+    [[ -d "$CLAUDE_HOME" ]]             && echo -e "  ${GREEN}✓${NC} ~/.claude/"                   || echo -e "  ${RED}✗${NC} ~/.claude/"
+    [[ -d "$HOME/.kube" ]]              && echo -e "  ${GREEN}✓${NC} ~/.kube/"                     || echo -e "  ${YELLOW}?${NC} ~/.kube/"
+    [[ -d "$HOME/.ssh" ]]               && echo -e "  ${GREEN}✓${NC} ~/.ssh/"                      || echo -e "  ${YELLOW}?${NC} ~/.ssh/"
+    if [[ "$CLAUDE_SAFE_MOUNT_SSH" == "true" ]] && [[ "${CLAUDE_SAFE_SSH_MODE:-agent}" == "agent" ]]; then
+        [[ -n "${SSH_AUTH_SOCK:-}" ]] && [[ -S "${SSH_AUTH_SOCK:-}" ]] \
+            && echo -e "  ${GREEN}✓${NC} SSH_AUTH_SOCK set (agent mode)" \
+            || echo -e "  ${YELLOW}?${NC} SSH_AUTH_SOCK not set — git SSH may fail (set SSH_MODE=keys or start ssh-agent)"
+    fi
+    if [[ -n "$CLAUDE_SAFE_RO_DIRS" ]]; then
+        local _ifs="$IFS"; IFS=':'
+        for _dir in $CLAUDE_SAFE_RO_DIRS; do
+            IFS="$_ifs"
+            [[ -d "$_dir" ]] && echo -e "  ${GREEN}✓${NC} ${_dir} (ro)" || echo -e "  ${YELLOW}?${NC} ${_dir} (ro)"
+        done
+        IFS="$_ifs"
+    fi
+    [[ -n "${CLAUDE_SAFE_KUBE_PROFILES:-}" ]] && {
+        local _ifs="$IFS"; IFS=':'
+        for ctx in $CLAUDE_SAFE_KUBE_PROFILES; do
+            IFS="$_ifs"
+            KUBECONFIG="$HOME/.kube/config" kubectl config get-contexts "$ctx" &>/dev/null \
+                && echo -e "  ${GREEN}✓${NC} kube context: $ctx" \
+                || echo -e "  ${RED}✗${NC} kube context not found: $ctx"
+        done
+        IFS="$_ifs"
+    }
+    echo ""
+
+    # Docker runtime detection
+    local _docker_ctx; _docker_ctx="$(docker context show 2>/dev/null || echo "")"
+    if docker version &>/dev/null; then
+        local server_info; server_info="$(docker version --format '{{.Server.Platform.Name}}' 2>/dev/null || echo "unknown")"
+        if echo "$server_info" | grep -qi orbstack || echo "$_docker_ctx" | grep -qi orbstack; then
+            echo -e "  ${GREEN}✓${NC} Docker via OrbStack"
+        elif echo "$_docker_ctx" | grep -qi colima; then
+            echo -e "  ${GREEN}✓${NC} Docker via Colima"
+        elif echo "$server_info" | grep -qi "docker desktop"; then
+            echo -e "  ${GREEN}✓${NC} Docker via Docker Desktop"
+            docker sandbox version &>/dev/null \
+                && echo -e "  ${GREEN}✓${NC} docker sandbox plugin" \
+                || echo -e "  ${YELLOW}?${NC} docker sandbox (need Desktop 4.50+)"
+        else
+            echo -e "  ${GREEN}✓${NC} Docker Engine ($server_info)"
+        fi
+        # buildx check (optional — _docker_build() falls back to legacy builder)
+        if docker buildx version &>/dev/null; then
+            echo -e "  ${GREEN}✓${NC} docker buildx"; ok=$((ok+1))
+        else
+            echo -e "  ${YELLOW}?${NC} docker buildx not found ${DIM}(builds will use legacy builder)${NC}"; w=$((w+1))
+            if [[ "$(uname)" == "Darwin" ]]; then
+                echo -e "     ${DIM}Install: brew install docker-buildx${NC}"
+            else
+                echo -e "     ${DIM}Install: https://github.com/docker/buildx#installing${NC}"
+            fi
+        fi
+        # credential helper check (only when credsStore is configured)
+        local _creds_store; _creds_store="$(_detect_creds_store || true)"
+        if [[ -n "$_creds_store" ]]; then
+            if command -v "docker-credential-${_creds_store}" &>/dev/null; then
+                echo -e "  ${GREEN}✓${NC} docker-credential-${_creds_store}"; ok=$((ok+1))
+            else
+                echo -e "  ${RED}✗${NC} docker-credential-${_creds_store} not found (required by ~/.docker/config.json)"; f=$((f+1))
+                [[ "$(uname)" == "Darwin" && "$_creds_store" == "osxkeychain" ]] \
+                    && echo -e "     ${DIM}Install: brew install docker-credential-helper${NC}"
+            fi
+        fi
+    else
+        echo -e "  ${RED}✗${NC} Docker not responding"
+    fi
+
+    # Resolved image check
+    local _resolved_image; _resolved_image="$(_resolve_image)"
+    if docker image inspect "$_resolved_image" &>/dev/null; then
+        echo -e "  ${GREEN}✓${NC} Image: $_resolved_image"
+        docker run --rm "$_resolved_image" tmux -V &>/dev/null \
+            && echo -e "  ${GREEN}✓${NC} tmux in image" \
+            || echo -e "  ${RED}✗${NC} tmux not found in image (required for session management)"
+    else
+        if _is_custom_template; then
+            echo -e "  ${RED}✗${NC} Image missing: $_resolved_image (run: claude-safe update --build)"
+        else
+            echo -e "  ${YELLOW}?${NC} Image not cached: $_resolved_image (will pull on next launch)"
+        fi
+    fi
+    # Detect orphaned legacy local image
+    if ! _is_custom_template && docker image inspect "claude-safe" &>/dev/null 2>&1; then
+        echo -e "  ${YELLOW}?${NC} Orphaned local image 'claude-safe' found ${DIM}(pre-GHCR era — safe to remove: docker rmi claude-safe)${NC}"
+    fi
+
+    # Image freshness
+    local _stamp="${CONFIG_DIR}/.last-update"
+    [[ -f "${CONFIG_DIR}/.last-build" ]] && [[ ! -f "$_stamp" ]] && _stamp="${CONFIG_DIR}/.last-build"
+    if [[ "$CLAUDE_SAFE_BUILD_INTERVAL" == "-1" ]]; then
+        echo -e "  ${YELLOW}?${NC} Auto-update disabled (BUILD_INTERVAL=-1)"
+    elif [[ -f "$_stamp" ]]; then
+        local _last _age _ago; _last="$(<"$_stamp")"; _age=$(( $(date +%s) - _last ))
+        if (( _age < 3600 )); then _ago="$(( _age / 60 ))m ago"
+        elif (( _age < 86400 )); then _ago="$(( _age / 3600 ))h ago"
+        else _ago="$(( _age / 86400 ))d ago"; fi
+        echo -e "  ${GREEN}✓${NC} Last image update: ${_ago}"
+    else
+        echo -e "  ${YELLOW}?${NC} Image never pulled/built — will update on next launch"
+    fi
+
+    # GitHub CLI config
+    [[ "$CLAUDE_SAFE_MOUNT_GH" == "true" ]] && {
+        [[ -d "$HOME/.config/gh" ]] \
+            && echo -e "  ${GREEN}✓${NC} ~/.config/gh/ (gh CLI auth)" \
+            || echo -e "  ${YELLOW}?${NC} ~/.config/gh/ missing — run 'gh auth login' on host"
+    }
+
+    # Claude OAuth credentials (macOS Keychain)
+    if [[ "$(uname)" == "Darwin" ]]; then
+        security find-generic-password -s "Claude Code-credentials" -w &>/dev/null \
+            && echo -e "  ${GREEN}✓${NC} Claude OAuth in macOS Keychain" \
+            || echo -e "  ${RED}✗${NC} No Claude OAuth in Keychain — run 'claude' on host to login"
+    elif [[ -f "${CLAUDE_HOME}/.credentials.json" ]] && [[ -s "${CLAUDE_HOME}/.credentials.json" ]]; then
+        echo -e "  ${GREEN}✓${NC} ~/.claude/.credentials.json"
+    else
+        echo -e "  ${YELLOW}?${NC} No credentials file — need 'claude login' or ANTHROPIC_API_KEY"
+    fi
+
+    # Host env var forwarding
+    [[ -n "${CLAUDE_SAFE_HOST_ENV:-}" ]] && {
+        echo ""
+        for varname in $CLAUDE_SAFE_HOST_ENV; do
+            local _val="${!varname:-}"
+            [[ -n "$_val" ]] \
+                && echo -e "  ${GREEN}✓${NC} \$${varname} set (${#_val} chars)" \
+                || echo -e "  ${YELLOW}?${NC} \$${varname} not set on host"
+        done
+    }
+
+    # Quick host-network check
+    if [[ "$CLAUDE_SAFE_NETWORK" == "host" ]]; then
+        docker run --rm --network host alpine:3.20 sh -c "echo ok" &>/dev/null \
+            && echo -e "  ${GREEN}✓${NC} --network host works" \
+            || echo -e "  ${YELLOW}?${NC} --network host may not work (check your Docker runtime settings)"
+    fi
+
+    # Docker socket mode checks
+    case "$CLAUDE_SAFE_DOCKER_SOCKET" in
+        proxy)
+            echo ""
+            [[ -S /var/run/docker.sock ]] \
+                && { echo -e "  ${GREEN}✓${NC} /var/run/docker.sock exists (proxy mode)"; ok=$((ok+1)); } \
+                || { echo -e "  ${RED}✗${NC} /var/run/docker.sock not found (required for proxy mode)"; f=$((f+1)); }
+            docker pull tecnativa/docker-socket-proxy:latest &>/dev/null \
+                && { echo -e "  ${GREEN}✓${NC} tecnativa/docker-socket-proxy image available"; ok=$((ok+1)); } \
+                || { echo -e "  ${YELLOW}?${NC} tecnativa/docker-socket-proxy not cached — will pull on first launch"; w=$((w+1)); }
+            local _orphans; _orphans="$(docker ps -a --filter name=cs-socket-proxy- --format '{{.Names}}' 2>/dev/null)"
+            [[ -n "$_orphans" ]] && echo -e "  ${YELLOW}?${NC} Orphaned proxy containers: ${_orphans} ${DIM}(run: claude-safe stop)${NC}"
+            ;;
+        true)
+            echo ""
+            if [[ "$CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM" == "true" ]]; then
+                echo -e "  ${YELLOW}!${NC} Docker socket=true — container has full host root access"; w=$((w+1))
+            else
+                echo -e "  ${RED}✗${NC} DOCKER_SOCKET=true requires DOCKER_SOCKET_CONFIRM=true"; f=$((f+1))
+            fi
+            ;;
+    esac
+
+    # Asset directory check
+    local _asset_dir; _asset_dir="$(_asset_dir)"
+    local _repo_dir="${CONFIG_DIR}/repo"
+    if [[ "$_asset_dir" != "$_repo_dir" ]]; then
+        echo -e "  ${GREEN}✓${NC} Assets: ${_asset_dir} ${DIM}(local checkout)${NC}"; ok=$((ok+1))
+    elif [[ -d "${_repo_dir}/.git" ]]; then
+        local _asset_ver; _asset_ver="$(git -C "$_repo_dir" describe --tags --exact-match 2>/dev/null || git -C "$_repo_dir" rev-parse --short HEAD 2>/dev/null || echo "unknown")"
+        echo -e "  ${GREEN}✓${NC} Assets: ${_repo_dir} ${DIM}(${_asset_ver})${NC}"; ok=$((ok+1))
+    else
+        echo -e "  ${YELLOW}?${NC} Assets not cloned — will clone on next update or first use"; w=$((w+1))
+    fi
+
+    # Project override check
+    local project_root; project_root="$(_repo_root 2>/dev/null || echo "")"
+    if [[ -n "$project_root" ]]; then
+        local override="${project_root}/.claude-safe/config"
+        if [[ -f "$override" ]]; then
+            if _is_trusted "$override"; then
+                echo -e "  ${GREEN}✓${NC} Project override: ${override} ${DIM}(trusted)${NC}"; ok=$((ok+1))
+            else
+                echo -e "  ${YELLOW}?${NC} Project override found but not trusted: ${override}"; w=$((w+1))
+                echo -e "     ${DIM}Run: claude-safe custom  to trust and load it${NC}"
+            fi
+        else
+            local project_name; project_name="$(basename "$project_root")"
+            echo -e "  ${DIM}  No project override for ${project_name}${NC}"
+        fi
+    fi
+
+    echo -e "\n  ${ok} ok, ${w} warn, ${f} fail\n"
+    [[ $f -eq 0 ]]
+}
+
+# ─── Completions ─────────────────────────────────────────────────────────────
+
+# Single definition — used both when sourced and emitted by --completions.
+_CS_COMP_BODY='_cs_comp() {
+    local cmds="new start ls rm merge shell stop dash install update config custom doctor tmux direct"
+    local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
+    case "$cmd" in
+        start|rm|merge|shell|stop)
+            local r d b=""; r="$(git rev-parse --show-toplevel 2>/dev/null)" || return
+            d="${r}/.worktrees"; [[ -d "$d" ]] && b="$(ls "$d" 2>/dev/null)"
+            COMPREPLY=($(compgen -W "$b" -- "$cur")) ;;
+        update)
+            COMPREPLY=($(compgen -W "--build --skip-script --skip-assets" -- "$cur")) ;;
+        *) COMPREPLY=($(compgen -W "$cmds" -- "$cur")) ;;
+    esac
+}'
+
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    eval "$_CS_COMP_BODY"
+    complete -F _cs_comp claude-safe; return 0
+fi
+
+# ─── Main ────────────────────────────────────────────────────────────────────
+
+_load_config
+
+# Cleanup credentials and staging on any exit (normal, Ctrl-C, SIGTERM, set -e).
+# Without this, OAuth tokens and COW staging copies persist after abnormal exits.
+_cleanup_on_exit() {
+    rm -f "${CLAUDE_HOME}/.credentials.json" 2>/dev/null || true
+    if [[ -n "${_COW_STAGING_DIR:-}" ]]; then
+        rm -rf "$_COW_STAGING_DIR" 2>/dev/null || true
+    else
+        rm -rf "${CONFIG_DIR}/.cow-staging" 2>/dev/null || true
+    fi
+}
+trap _cleanup_on_exit EXIT
+
+if [[ "${1:-}" == "--dangerous" ]]; then
+    CLAUDE_SAFE_PERMISSION_MODE="bypass"
+    shift
+fi
+
+case "${1:-}" in
+    new)     shift; cmd_new "$@" ;;
+    start)   shift; cmd_start "$@" ;;
+    ls)      cmd_ls ;;
+    rm)      shift; cmd_rm "$@" ;;
+    merge)   shift; cmd_merge "$@" ;;
+    shell)   shift; cmd_shell "${1:-}" ;;
+    stop)    shift; cmd_stop "$@" ;;
+    dash)    cmd_dash ;;
+    install) cmd_install ;;
+    update)  shift; cmd_update "$@" ;;
+    config)  shift; cmd_config "${1:-}" ;;
+    custom)  shift; cmd_custom "$@" ;;
+    doctor)  cmd_doctor ;;
+    tmux)    shift; cmd_tmux "$@" ;;
+    direct)  shift; cmd_direct "$@" ;;
+    version|-V) echo "claude-safe v${CLAUDE_SAFE_VERSION}" ;;
+    --completions) printf '%s\n' "$_CS_COMP_BODY" "complete -F _cs_comp claude-safe" ;;
+    -h|--help|help) cat << EOF
+${BOLD}claude-safe v${CLAUDE_SAFE_VERSION}${NC} — Sandboxed Claude Code with worktrees
+
+${BOLD}USAGE${NC}
+  claude-safe [command] [options]
+
+${BOLD}SESSIONS${NC}
+  (default)               Smart reattach or create session
+  new <branch> [prompt]   Create worktree + sandbox + session
+  start <branch>          Reattach to existing session
+  stop <branch>           Stop container
+  rm <branch>             Stop container + remove worktree
+
+${BOLD}TOOLS${NC}
+  ls                      List containers and sessions
+  dash                    Container overview dashboard
+  merge <branch> [--squash]  Merge worktree branch back
+  shell [branch]          Shell into container
+
+${BOLD}LAUNCH MODES${NC}
+  tmux [args]             Force tmux session
+  direct [args]           Direct launch (no tmux)
+  --dangerous             Bypass Claude permission prompts
+
+${BOLD}SETUP${NC}
+  install                 Interactive installer / reconfigure
+  update [--build]        Pull image from GHCR + self-update script
+  config                  Show current configuration
+  config --reconfigure    Interactive wizard to update all settings
+  config --migrate        Migrate legacy config.sh
+  custom [--list|--rm]    Manage per-project config overrides
+  doctor                  Verify setup
+  version                 Show version
+
+${DIM}Tip: CLAUDE_SAFE_TMUX=false in config to always launch without tmux${NC}
+EOF
+        ;;
+    "") cmd_auto ;;
+    *)  cmd_auto "$@" ;;
+esac

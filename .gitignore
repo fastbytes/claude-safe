@@ -1,0 +1,50 @@
+# Local configuration
+config.sh
+config.local.sh
+*.local.sh
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+._*
+
+# Editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.*.swp
+.*.swo
+
+# Vim
+[._]*.s[a-v][a-z]
+[._]*.sw[a-p]
+[._]s[a-rt-v][a-z]
+[._]ss[a-gi-z]
+[._]sw[a-p]
+
+# Logs
+*.log
+logs/
+
+# Temporary files
+*.tmp
+*.temp
+tmp/
+temp/
+
+# Docker
+.dockerignore
+
+# Test files
+test-output/
+.test-output/
+*.test
+
+# Credentials (defense in depth)
+*.key
+*.pem
+credentials.json
+.credentials.json
