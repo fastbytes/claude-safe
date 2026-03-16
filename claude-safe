@@ -384,6 +384,19 @@ _add_docker_args() {
         && cmd+=(-v "${CLAUDE_SAFE_TMUX_CONF}:${CLAUDE_SAFE_CONTAINER_TMUX_CONF}:ro")
 }
 
+_docker_build() {
+    # Build a Docker image with buildx if available, falling back to legacy builder.
+    # Usage: _docker_build -t <image> -f <dockerfile> [--no-cache] <context>
+    local args=("$@")
+    if docker buildx version &>/dev/null 2>&1; then
+        docker buildx build "${args[@]}"
+    else
+        local arch; arch="$(uname -m)"
+        [[ "$arch" == "aarch64" || "$arch" == "arm64" ]] && arch="arm64" || arch="amd64"
+        docker build --build-arg "TARGETARCH=${arch}" "${args[@]}"
+    fi
+}
+
 _maybe_build_image() {
     # Rebuild image if stale (older than CLAUDE_SAFE_BUILD_INTERVAL seconds).
     # Skipped when interval is -1.
@@ -401,7 +414,7 @@ _maybe_build_image() {
     fi
 
     _dim "→ Rebuilding image…"
-    if docker buildx build -f "${SELF%/*}/Dockerfile.claude-safe" -t "$image" "${SELF%/*}"; then
+    if _docker_build -f "${SELF%/*}/Dockerfile.claude-safe" -t "$image" "${SELF%/*}"; then
         echo "$now" > "$stamp_file"
     else
         _warn "Image build failed — using cached image"
@@ -621,6 +634,66 @@ _migrate_config() {
     $changed
 }
 
+# Rebuild config.sh from config.example.sh, preserving user values.
+# New vars get example defaults + comments; removed vars are dropped.
+_rebuild_config() {
+    local cfg="$1" example="$2"
+
+    # Capture current user values (raw lines, preserving quotes/spaces)
+    declare -A user_vars
+    while IFS= read -r line; do
+        local key="${line%%=*}"
+        local val="${line#*=}"
+        user_vars[$key]="$val"
+    done < <(grep '^CLAUDE_SAFE_[A-Z0-9_]*=' "$cfg")
+
+    declare -A example_vars
+    local new_vars=() removed_vars=()
+    local tmp; tmp="$(mktemp)"
+
+    while IFS= read -r line; do
+        if [[ "$line" =~ ^(CLAUDE_SAFE_[A-Z0-9_]+)= ]]; then
+            local key="${BASH_REMATCH[1]}"
+            example_vars[$key]=1
+            if [[ -v "user_vars[$key]" ]]; then
+                echo "${key}=${user_vars[$key]}" >> "$tmp"
+            else
+                echo "$line" >> "$tmp"
+                new_vars+=("$key")
+            fi
+        else
+            echo "$line" >> "$tmp"
+        fi
+    done < "$example"
+
+    for key in "${!user_vars[@]}"; do
+        [[ -v "example_vars[$key]" ]] || removed_vars+=("$key")
+    done
+
+    for v in "${new_vars[@]}";     do _info "Config: added ${v}"; done
+    for v in "${removed_vars[@]}"; do _info "Config: removed deprecated ${v}"; done
+
+    if (( ${#new_vars[@]} + ${#removed_vars[@]} > 0 )) || ! diff -q "$cfg" "$tmp" >/dev/null 2>&1; then
+        mv "$tmp" "$cfg"
+        _info "Config updated: ${cfg}"
+    else
+        rm -f "$tmp"
+        _info "Config already up to date"
+    fi
+}
+
+# Apply renames/deletes then rebuild config from the example template.
+_update_config() {
+    local cfg="$CONFIG_FILE"
+    local example="${SELF%/*}/config.example.sh"
+
+    [[ -f "$cfg" ]]     || { _info "No config found — skipping migration (run install first)"; return 0; }
+    [[ -f "$example" ]] || { _info "config.example.sh not found — skipping config rebuild"; return 0; }
+
+    _migrate_config "$cfg" || true
+    _rebuild_config "$cfg" "$example"
+}
+
 cmd_install() {
     local script_dir="${SELF%/*}"
 
@@ -778,10 +851,11 @@ CONF
     [[ -f "$dockerfile" ]] || dockerfile="$PWD/Dockerfile.claude-safe"
     if [[ -f "$dockerfile" ]]; then
         if _ask_yn "Build claude-safe image now?" "y"; then
-            docker buildx build -t claude-safe -f "$dockerfile" "$(dirname "$dockerfile")"
+            _docker_build -t claude-safe -f "$dockerfile" "$(dirname "$dockerfile")"
+            mkdir -p "${CONFIG_DIR}" && date +%s > "${CONFIG_DIR}/.last-build"
             _info "Image built: claude-safe"
         else
-            _warn "Skipped. Build later: docker buildx build -t claude-safe -f Dockerfile.claude-safe ."
+            _warn "Skipped. Build later: docker build -t claude-safe -f Dockerfile.claude-safe ."
         fi
     else
         _warn "Dockerfile.claude-safe not found — build manually from the repo directory"
@@ -1050,19 +1124,32 @@ cmd_direct() {
 
 cmd_update() {
     # Force-rebuild the Docker image (ignores BUILD_INTERVAL).
+    # Usage: update [--no-cache]
     _require docker
+    local no_cache=false
+    [[ "${1:-}" == "--no-cache" ]] && no_cache=true
+
     local image="${CLAUDE_SAFE_TEMPLATE:-claude-safe}"
     local stamp_file="${CONFIG_DIR}/.last-build"
     mkdir -p "${CONFIG_DIR}"
 
+    local dockerfile="${SELF%/*}/Dockerfile.claude-safe"
+    [[ -f "$dockerfile" ]] || dockerfile="$PWD/Dockerfile.claude-safe"
+    [[ -f "$dockerfile" ]] || { _error "Dockerfile.claude-safe not found"; return 1; }
+
+    local build_args=(-f "$dockerfile" -t "$image" "$(dirname "$dockerfile")")
+    [[ "$no_cache" == "true" ]] && build_args+=(--no-cache)
+
     _info "Building image: ${CYAN}${image}${NC}"
-    if docker buildx build -f "${SELF%/*}/Dockerfile.claude-safe" -t "$image" "${SELF%/*}"; then
+    if _docker_build "${build_args[@]}"; then
         date +%s > "$stamp_file"
         _info "Image built: ${CYAN}${image}${NC}"
     else
         _error "Image build failed"
         return 1
     fi
+
+    _update_config
 }
 
 cmd_config() {
@@ -1332,7 +1419,7 @@ ${BOLD}COMMANDS${NC}
   merge <branch> [--squash]                         shell [branch]  Shell into sandbox
   dash                    Container overview
   install                 Interactive installer / reconfigure
-  update                  Rebuild Docker image       config          Show config
+  update [--no-cache]     Rebuild Docker image       config          Show config
   doctor                  Verify setup               --raw [args]    Alias for direct
   tmux [args]             Force tmux session         direct [args]   Direct launch (no tmux)
   --dangerous                     Bypass Claude permission prompts (safe in container)
