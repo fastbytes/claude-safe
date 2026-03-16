@@ -36,10 +36,10 @@ claude-safe rm add-search  # stop container + delete worktree + branch
 | `Alt-←` `Alt-→` `Alt-↑` `Alt-↓` | Switch panes |
 | `Ctrl-b Shift-←/→/↑/↓` | Resize pane |
 | `Ctrl-b d` | Detach (back to host, container stays running) |
-| `Ctrl-b D` | Detach (explicit, avoids accidental on iPad) |
+| `Ctrl-b D` | Detach (explicit alternative to Ctrl-b d) |
 | `Ctrl-b z` | Zoom pane (toggle fullscreen) |
 | `Ctrl-b [` | Copy mode (vi keys, `v` select, `y` copy) |
-| `Ctrl-b R` | Force redraw (fixes Mosh glitches) |
+| `Ctrl-b R` | Force redraw (fixes rendering glitches) |
 | `Ctrl-b S` | Session chooser |
 
 ## Claude Code commands
@@ -87,6 +87,6 @@ claude-safe --raw              # disposable container, no tmux (debugging)
 
 **"Not logged in":** Run `claude` on the host once to populate Keychain. `claude-safe doctor` checks this.
 
-**Mosh rendering glitch:** `Ctrl-b R` to redraw, or `Ctrl-l` inside a pane.
+**Rendering glitch:** `Ctrl-b R` to redraw, or `Ctrl-l` inside a pane.
 
 **Kill everything:** `docker rm -f $(docker ps --filter label=claude-safe -q)`

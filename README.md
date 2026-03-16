@@ -1,6 +1,6 @@
 # claude-safe
 
-Sandboxed Claude Code launcher. Runs Claude Code inside Docker containers with tmux session management, git worktree isolation, and iPad remote access via Mosh.
+Sandboxed Claude Code launcher. Runs Claude Code inside Docker containers with tmux session management and git worktree isolation.
 
 ## Architecture
 
@@ -174,12 +174,12 @@ docker build -t claude-safe -f Dockerfile.claude-safe .
 ## Remote workflow
 
 ```
-Remote terminal → SSH/Mosh → Mac (tmux inside container)
+Remote terminal → SSH/Mosh/any → host (tmux inside container)
 ```
 
-1. Set up SSH or Mosh server on the Mac (Mosh uses ports 60000-60010)
+1. Connect to the host via SSH, Mosh, or any remote terminal
 2. Configure `CLAUDE_SAFE_TMUX_CONF` to point to `tmux.conf`
-3. From remote: `mosh mac -- claude-safe`
+3. From remote: `claude-safe`
 4. `Ctrl-b d` to detach, disconnect, reconnect anytime
 
-Mosh survives network changes. tmux inside the container survives Mosh reconnects. The container survives everything until explicitly stopped.
+tmux inside the container survives reconnects. The container survives everything until explicitly stopped.
