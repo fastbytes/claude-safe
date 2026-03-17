@@ -1246,6 +1246,15 @@ cmd_update() {
     fi
 
     _update_config
+
+    # Self-update: copy current script to the installed location (if we're running from elsewhere)
+    local install_bin="${CLAUDE_SAFE_INSTALL_BIN:-$HOME/.local/bin/claude-safe}"
+    if [[ "$SELF" != "$install_bin" ]] && [[ -f "$install_bin" ]]; then
+        _info "Updating script: ${CYAN}${install_bin}${NC}"
+        cp "$SELF" "$install_bin"
+        chmod +x "$install_bin"
+        _info "Script updated → ${CYAN}${install_bin}${NC}"
+    fi
 }
 
 cmd_config() {
