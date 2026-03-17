@@ -23,7 +23,7 @@
 #   claude-safe doctor                   Verify dependencies + config
 #   claude-safe --raw [args]             Internal: direct sandbox launch
 #
-# Config: ~/.config/claude-safe/config.sh
+# Config: ~/.config/claude-safe/config  (or config.sh for legacy)
 
 set -euo pipefail
 
@@ -96,7 +96,10 @@ CLAUDE_COW_FILES=(settings.json)
 : "${CLAUDE_SAFE_VERSION_CHECK:=true}"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-safe"
-CONFIG_FILE="${CONFIG_DIR}/config.sh"
+CONFIG_FILE="${CONFIG_DIR}/config.sh"   # legacy bash config (deprecated)
+_GLOBAL_CONFIG_FILE=""
+_OVERRIDE_FILE=""
+_TRUSTED_FILE="${CONFIG_DIR}/trusted-overrides"
 
 # ─── Colors ──────────────────────────────────────────────────────────────────
 
@@ -110,53 +113,137 @@ _dim()   { echo -e "${DIM}  $*${NC}"; }
 
 # ─── Config ──────────────────────────────────────────────────────────────────
 
+_parse_config() {
+    # Parse a declarative KEY=VALUE config file. No eval, no shell expansion.
+    # Only sets CLAUDE_SAFE_* variables. Second arg restrict_notify=true blocks
+    # CLAUDE_SAFE_NOTIFY_CMD (which executes on host — must only come from global config).
+    local file="$1" restrict_notify="${2:-false}"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        # Skip comments and blank lines
+        [[ "$line" =~ ^[[:space:]]*(#|$) ]] && continue
+        # Strip inline comments (not inside quotes — simple heuristic)
+        line="${line%%[[:space:]]#*}"
+        # Match KEY=VALUE
+        if [[ "$line" =~ ^[[:space:]]*([A-Z_][A-Z_0-9]*)=(.*)[[:space:]]*$ ]]; then
+            local key="${BASH_REMATCH[1]}" val="${BASH_REMATCH[2]}"
+            # Strip surrounding quotes
+            if [[ "$val" =~ ^\"(.*)\"$ ]] || [[ "$val" =~ ^\'(.*)\'$ ]]; then
+                val="${BASH_REMATCH[1]}"
+            fi
+            # Expand $HOME and ~/
+            val="${val//\$HOME/$HOME}"
+            val="${val/#\~\//$HOME/}"
+            # Only set known CLAUDE_SAFE_* variables
+            case "$key" in
+                CLAUDE_SAFE_NOTIFY_CMD)
+                    [[ "$restrict_notify" == "true" ]] && continue
+                    printf -v "$key" '%s' "$val" ;;
+                CLAUDE_SAFE_*)
+                    printf -v "$key" '%s' "$val" ;;
+            esac
+        fi
+    done < "$file"
+}
+
+_check_file_security() {
+    local file="$1"
+    if [[ -L "$file" ]]; then
+        _warn "Config file is a symlink — skipping: $file"; return 1; fi
+    local _owner _perms
+    if [[ "$(uname)" == "Darwin" ]]; then
+        _owner="$(/usr/bin/stat -f '%u' "$file" 2>/dev/null)"
+        _perms="$(/usr/bin/stat -f '%A' "$file" 2>/dev/null)"
+    else
+        _owner="$(stat -c '%u' "$file" 2>/dev/null)"
+        _perms="$(stat -c '%a' "$file" 2>/dev/null)"
+    fi
+    if [[ "$_owner" != "$(id -u)" ]]; then
+        _warn "Config file not owned by current user — skipping: $file"; return 1; fi
+    if [[ "${_perms: -2:1}" == [2367] ]] || [[ "${_perms: -1:1}" == [2367] ]]; then
+        _warn "Config file is group/world-writable — skipping: $file"; return 1; fi
+    return 0
+}
+
 _init_config() {
     mkdir -p "$CONFIG_DIR"
-    [[ -f "$CONFIG_FILE" ]] && return
-    cp "${SELF%/*}/config.example.sh" "$CONFIG_FILE" 2>/dev/null || {
-        _info "Created empty config: ${CONFIG_FILE}"
-        touch "$CONFIG_FILE"
-    }
+    local config_declarative="${CONFIG_DIR}/config"
+    # Only create config if neither format exists yet
+    if [[ ! -f "$config_declarative" ]] && [[ ! -f "$CONFIG_FILE" ]]; then
+        cp "${SELF%/*}/config.example" "$config_declarative" 2>/dev/null || {
+            _info "Created empty config: ${config_declarative}"
+            touch "$config_declarative"
+        }
+    fi
+}
+
+_is_trusted() {
+    local path="$1"
+    [[ -f "$_TRUSTED_FILE" ]] && grep -qFx "$path" "$_TRUSTED_FILE" 2>/dev/null
+}
+
+_trust_override() {
+    local path="$1"
+    mkdir -p "$(dirname "$_TRUSTED_FILE")"
+    _is_trusted "$path" || echo "$path" >> "$_TRUSTED_FILE"
+}
+
+_untrust_override() {
+    local path="$1"
+    [[ -f "$_TRUSTED_FILE" ]] || return 0
+    local tmp; tmp="$(grep -vFx "$path" "$_TRUSTED_FILE" 2>/dev/null || true)"
+    printf '%s\n' "$tmp" > "$_TRUSTED_FILE"
+}
+
+_load_project_override() {
+    _OVERRIDE_FILE=""
+    local project_root
+    project_root="$(_repo_root 2>/dev/null || echo "$PWD")"
+    local override="${project_root}/.claude-safe/config"
+    [[ -f "$override" ]] || return 0
+
+    if ! _is_trusted "$override"; then
+        # Interactive trust prompt (skip in non-interactive shells)
+        if [[ -t 0 ]]; then
+            _warn "Project override found: $override"
+            if _ask_yn "Trust and load this project override?" "n"; then
+                _trust_override "$override"
+            else
+                return 0
+            fi
+        else
+            return 0
+        fi
+    fi
+
+    _parse_config "$override" true   # restrict_notify=true
+    _OVERRIDE_FILE="$override"
 }
 
 _load_config() {
     _init_config
-    [[ -f "$CONFIG_FILE" ]] || return 0
 
-    # Reject symlinks to prevent bypassing ownership/permission checks
-    if [[ -L "$CONFIG_FILE" ]]; then
-        _warn "Config file is a symlink — skipping: $CONFIG_FILE"
-        return 0
-    fi
-
-    # Verify ownership and permissions before sourcing to prevent config poisoning.
-    # File must be owned by current user and not group/world-writable.
-    local _owner _perms
-    if [[ "$(uname)" == "Darwin" ]]; then
-        _owner="$(/usr/bin/stat -f '%u' "$CONFIG_FILE" 2>/dev/null)"
-        _perms="$(/usr/bin/stat -f '%A' "$CONFIG_FILE" 2>/dev/null)"
+    # New declarative format takes precedence
+    local config_declarative="${CONFIG_DIR}/config"
+    if [[ -f "$config_declarative" ]]; then
+        _check_file_security "$config_declarative" || return 0
+        unset CLAUDE_SAFE_NOTIFY_CMD
+        _parse_config "$config_declarative" false
+        : "${CLAUDE_SAFE_NOTIFY_CMD:=}"
+        _GLOBAL_CONFIG_FILE="$config_declarative"
+    elif [[ -f "$CONFIG_FILE" ]]; then
+        # Legacy bash config — show migration warning
+        _check_file_security "$CONFIG_FILE" || return 0
+        _warn "Legacy config.sh detected. Run 'claude-safe config --migrate' to convert."
+        unset CLAUDE_SAFE_NOTIFY_CMD
+        # shellcheck source=/dev/null
+        source "$CONFIG_FILE"
+        : "${CLAUDE_SAFE_NOTIFY_CMD:=}"
+        _GLOBAL_CONFIG_FILE="$CONFIG_FILE"
     else
-        _owner="$(stat -c '%u' "$CONFIG_FILE" 2>/dev/null)"
-        _perms="$(stat -c '%a' "$CONFIG_FILE" 2>/dev/null)"
-    fi
-    if [[ "$_owner" != "$(id -u)" ]]; then
-        _warn "Config file not owned by current user — skipping: $CONFIG_FILE"
-        return 0
-    fi
-    # Reject group-write (bit 4 in middle octet) or world-write (bit 2 in last octet)
-    if [[ "${_perms: -2:1}" == [2367] ]] || [[ "${_perms: -1:1}" == [2367] ]]; then
-        _warn "Config file is group/world-writable — skipping: $CONFIG_FILE"
-        return 0
+        _GLOBAL_CONFIG_FILE=""
     fi
 
-    # NOTIFY_CMD runs on the host with full privileges — only honor values from
-    # the ownership-checked config file, never from inherited environment.
-    unset CLAUDE_SAFE_NOTIFY_CMD
-
-    # shellcheck source=/dev/null
-    source "$CONFIG_FILE"
-
-    : "${CLAUDE_SAFE_NOTIFY_CMD:=}"
+    _load_project_override
 }
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -595,7 +682,7 @@ _check_claude_version() {
     # Compare installed Claude Code version against npm latest. Warn if stale.
     local container="$1"
     local installed latest
-    installed="$(docker exec "$container" claude --version 2>/dev/null)" || return 0
+    installed="$(docker exec "$container" claude --version 2>/dev/null | awk '{print $1}')" || return 0
     latest="$(curl -sf --max-time 3 https://registry.npmjs.org/@anthropic-ai/claude-code/latest | grep -o '"version":"[^"]*"' | head -1 | cut -d'"' -f4)" || return 0
     [[ -z "$installed" || -z "$latest" ]] && return 0
     [[ "$installed" == "$latest" ]] && return 0
@@ -910,6 +997,14 @@ _rebuild_config() {
 
 # Apply renames/deletes then rebuild config from the example template.
 _update_config() {
+    local config_declarative="${CONFIG_DIR}/config"
+
+    if [[ -f "$config_declarative" ]]; then
+        # New declarative format: apply variable renames/deletes only (no rebuild needed)
+        _migrate_config "$config_declarative" || true
+        return 0
+    fi
+
     local cfg="$CONFIG_FILE"
     local example="${SELF%/*}/config.example.sh"
 
@@ -946,18 +1041,26 @@ cmd_install() {
     # Detect existing config + migrate
     _ihead "Existing configuration"
     local skip_config=false
-    if [[ -f "$CONFIG_FILE" ]]; then
-        _info "Found existing config: $CONFIG_FILE"
+    local existing_config=""
+    local config_declarative="${CONFIG_DIR}/config"
+    if [[ -f "$config_declarative" ]]; then
+        existing_config="$config_declarative"
+    elif [[ -f "$CONFIG_FILE" ]]; then
+        existing_config="$CONFIG_FILE"
+    fi
+    if [[ -n "$existing_config" ]]; then
+        _info "Found existing config: $existing_config"
         # Always migrate first (rename/remove/add deprecated vars)
         _ihead "Migrating config"
-        if _migrate_config "$CONFIG_FILE"; then
+        if _migrate_config "$existing_config"; then
             _info "Config updated"
         else
             _info "Config already up to date"
         fi
         if _ask_yn "Reconfigure interactively (current values become defaults)?" "n"; then
             # shellcheck source=/dev/null
-            source "$CONFIG_FILE"
+            [[ "$existing_config" == "$CONFIG_FILE" ]] && source "$existing_config" \
+                || _parse_config "$existing_config" false
             _info "Loaded existing config as defaults"
         else
             _info "Keeping existing config."
@@ -1022,25 +1125,27 @@ cmd_install() {
         # Write config
         _ihead "Writing config"
         mkdir -p "$CONFIG_DIR"
-        cat > "$CONFIG_FILE" <<CONF
-# ~/.config/claude-safe/config.sh
+        local config_out="${CONFIG_DIR}/config"
+        cat > "$config_out" <<CONF
+# ~/.config/claude-safe/config
 # Generated by claude-safe install on $(date -u +%Y-%m-%dT%H:%M:%SZ)
 
 # ── Core ─────────────────────────────────────────────────────────────────────
-CLAUDE_SAFE_PERMISSION_MODE="${permission_mode}"
-CLAUDE_SAFE_NETWORK="${network}"
+CLAUDE_SAFE_PERMISSION_MODE=${permission_mode}
+CLAUDE_SAFE_NETWORK=${network}
 
 # ── Mounts ───────────────────────────────────────────────────────────────────
-CLAUDE_SAFE_RO_DIRS="${ro_dirs}"
+CLAUDE_SAFE_RO_DIRS=${ro_dirs}
 CONF
         # Only write mount flags when false (true is the default; omitting lets the script default handle it)
-        [[ "$mount_kube" == "false" ]]     && echo "CLAUDE_SAFE_MOUNT_KUBE=false"                        >> "$CONFIG_FILE"
-        [[ -n "$kube_profiles" ]]          && echo "CLAUDE_SAFE_KUBE_PROFILES=\"${kube_profiles}\""      >> "$CONFIG_FILE"
-        [[ "$mount_ssh" == "false" ]]      && echo "CLAUDE_SAFE_MOUNT_SSH=false"                         >> "$CONFIG_FILE"
-        [[ "$mount_gh" == "false" ]]       && echo "CLAUDE_SAFE_MOUNT_GH=false"                          >> "$CONFIG_FILE"
-        [[ "$mount_gitconfig" == "false" ]] && echo "CLAUDE_SAFE_MOUNT_GITCONFIG=false"                  >> "$CONFIG_FILE"
-        [[ -n "$tmux_conf" ]] && echo "CLAUDE_SAFE_TMUX_CONF=\"${tmux_conf}\"" >> "$CONFIG_FILE"
-        _info "Config written to $CONFIG_FILE"
+        [[ "$mount_kube" == "false" ]]      && echo "CLAUDE_SAFE_MOUNT_KUBE=false"              >> "$config_out"
+        [[ -n "$kube_profiles" ]]           && echo "CLAUDE_SAFE_KUBE_PROFILES=${kube_profiles}" >> "$config_out"
+        [[ "$mount_ssh" == "false" ]]       && echo "CLAUDE_SAFE_MOUNT_SSH=false"               >> "$config_out"
+        [[ "$mount_gh" == "false" ]]        && echo "CLAUDE_SAFE_MOUNT_GH=false"                >> "$config_out"
+        [[ "$mount_gitconfig" == "false" ]] && echo "CLAUDE_SAFE_MOUNT_GITCONFIG=false"         >> "$config_out"
+        [[ -n "$tmux_conf" ]]               && echo "CLAUDE_SAFE_TMUX_CONF=${tmux_conf}"        >> "$config_out"
+        chmod 600 "$config_out"
+        _info "Config written to $config_out"
     fi
 
     # Install script
@@ -1352,45 +1457,187 @@ cmd_update() {
     fi
 }
 
+_cfg_src() {
+    # Print colored source label for a config variable: (override), (global), or (default).
+    local var="$1"
+    if [[ -n "${_OVERRIDE_FILE:-}" ]] && grep -q "^[[:space:]]*${var}=" "$_OVERRIDE_FILE" 2>/dev/null; then
+        printf '%b(override)%b' "$YELLOW" "$NC"
+    elif [[ -n "${_GLOBAL_CONFIG_FILE:-}" ]] && grep -q "^[[:space:]]*${var}=" "$_GLOBAL_CONFIG_FILE" 2>/dev/null; then
+        printf '%b(global)%b' "$DIM" "$NC"
+    else
+        printf '%b(default)%b' "$DIM" "$NC"
+    fi
+}
+
+_convert_config_sh() {
+    # Convert legacy config.sh (bash) to new declarative config format.
+    local old="${CONFIG_DIR}/config.sh" new="${CONFIG_DIR}/config"
+    if [[ ! -f "$old" ]]; then
+        _info "No config.sh to migrate."; return 0; fi
+    if [[ -f "$new" ]]; then
+        _warn "Both config.sh and config exist. Edit $new directly."; return 1; fi
+    {
+        echo "# Migrated from config.sh on $(date +%Y-%m-%d)"
+        echo "# Review and delete config.sh when satisfied."
+        echo ""
+        grep -E '^[[:space:]]*CLAUDE_SAFE_[A-Z_]+=' "$old" | sed 's/^[[:space:]]*//'
+    } > "$new"
+    chmod 600 "$new"
+    _info "Created: $new"
+    _info "Review it, then delete config.sh"
+}
+
 cmd_config() {
+    case "${1:-}" in
+        --migrate) _convert_config_sh; return ;;
+    esac
+
     cat << EOF
 
-${BOLD}claude-safe v${CLAUDE_SAFE_VERSION}${NC}    Config: ${CONFIG_FILE}
+${BOLD}claude-safe v${CLAUDE_SAFE_VERSION}${NC}
+  Config:   ${_GLOBAL_CONFIG_FILE:-<none>}
+  Override: ${_OVERRIDE_FILE:-<none>}
 
 ${BOLD}Sandbox${NC}
-  MODE             ${CLAUDE_SAFE_SANDBOX_MODE}
-  TEMPLATE         ${CLAUDE_SAFE_TEMPLATE:-<default: claude-safe>}
-  BUILD_INTERVAL   ${CLAUDE_SAFE_BUILD_INTERVAL}s   ${DIM}(0=always, -1=never)${NC}
-  NETWORK          ${CLAUDE_SAFE_NETWORK}
-  CREDENTIALS      ${CLAUDE_SAFE_CREDENTIALS}
+  MODE             ${CLAUDE_SAFE_SANDBOX_MODE}  $(_cfg_src CLAUDE_SAFE_SANDBOX_MODE)
+  TEMPLATE         ${CLAUDE_SAFE_TEMPLATE:-<default: claude-safe>}  $(_cfg_src CLAUDE_SAFE_TEMPLATE)
+  BUILD_INTERVAL   ${CLAUDE_SAFE_BUILD_INTERVAL}s   ${DIM}(0=always, -1=never)${NC}  $(_cfg_src CLAUDE_SAFE_BUILD_INTERVAL)
+  NETWORK          ${CLAUDE_SAFE_NETWORK}  $(_cfg_src CLAUDE_SAFE_NETWORK)
+  CREDENTIALS      ${CLAUDE_SAFE_CREDENTIALS}  $(_cfg_src CLAUDE_SAFE_CREDENTIALS)
 
 ${BOLD}Mounts${NC}                                     ${BOLD}~/.claude/ detail${NC}
-  ~/.claude/       ${CLAUDE_SAFE_MOUNT_CLAUDE}  (granular)        ${DIM}RO: settings.json CLAUDE.md commands/${NC}
-  ~/.kube/         ${CLAUDE_SAFE_MOUNT_KUBE}  profiles: ${CLAUDE_SAFE_KUBE_PROFILES:-<all>}
-  ~/.ssh/          ${CLAUDE_SAFE_MOUNT_SSH}  (${CLAUDE_SAFE_SSH_MODE})          ${DIM}    skills/ agents/ .credentials.json${NC}
-  ~/.gitconfig     ${CLAUDE_SAFE_MOUNT_GITCONFIG}  (ro)               ${DIM}RW: projects/ plans/ todos/ file-history/${NC}
-  ~/.config/gh/    ${CLAUDE_SAFE_MOUNT_GH}  (ro)               ${DIM}    session-env/ debug/ statsig/${NC}
-  Tailscale        ${CLAUDE_SAFE_MOUNT_TAILSCALE}                   ${DIM}    ide/ telemetry/ teams/ history.jsonl${NC}
-  Docker socket    ${CLAUDE_SAFE_DOCKER_SOCKET}  confirm: ${CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM}       ${DIM}    stats-cache.json shell-snapshots/${NC}
-  RO dirs          ${CLAUDE_SAFE_RO_DIRS:-<none>}
-  RW dirs          ${CLAUDE_SAFE_RW_DIRS:-<none>}
-  DIRENV_AUTO_ALLOW  ${CLAUDE_SAFE_DIRENV_AUTO_ALLOW}
+  ~/.claude/       ${CLAUDE_SAFE_MOUNT_CLAUDE}  (granular)  $(_cfg_src CLAUDE_SAFE_MOUNT_CLAUDE)    ${DIM}RO: settings.json CLAUDE.md commands/${NC}
+  ~/.kube/         ${CLAUDE_SAFE_MOUNT_KUBE}  profiles: ${CLAUDE_SAFE_KUBE_PROFILES:-<all>}  $(_cfg_src CLAUDE_SAFE_MOUNT_KUBE)
+  ~/.ssh/          ${CLAUDE_SAFE_MOUNT_SSH}  (${CLAUDE_SAFE_SSH_MODE})  $(_cfg_src CLAUDE_SAFE_MOUNT_SSH)    ${DIM}    skills/ agents/ .credentials.json${NC}
+  ~/.gitconfig     ${CLAUDE_SAFE_MOUNT_GITCONFIG}  (ro)  $(_cfg_src CLAUDE_SAFE_MOUNT_GITCONFIG)    ${DIM}RW: projects/ plans/ todos/ file-history/${NC}
+  ~/.config/gh/    ${CLAUDE_SAFE_MOUNT_GH}  (ro)  $(_cfg_src CLAUDE_SAFE_MOUNT_GH)    ${DIM}    session-env/ debug/ statsig/${NC}
+  Tailscale        ${CLAUDE_SAFE_MOUNT_TAILSCALE}  $(_cfg_src CLAUDE_SAFE_MOUNT_TAILSCALE)    ${DIM}    ide/ telemetry/ teams/ history.jsonl${NC}
+  Docker socket    ${CLAUDE_SAFE_DOCKER_SOCKET}  confirm: ${CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM}  $(_cfg_src CLAUDE_SAFE_DOCKER_SOCKET)   ${DIM}    stats-cache.json shell-snapshots/${NC}
+  RO dirs          ${CLAUDE_SAFE_RO_DIRS:-<none>}  $(_cfg_src CLAUDE_SAFE_RO_DIRS)
+  RW dirs          ${CLAUDE_SAFE_RW_DIRS:-<none>}  $(_cfg_src CLAUDE_SAFE_RW_DIRS)
+  DIRENV_AUTO_ALLOW  ${CLAUDE_SAFE_DIRENV_AUTO_ALLOW}  $(_cfg_src CLAUDE_SAFE_DIRENV_AUTO_ALLOW)
 
 ${BOLD}Worktree + tmux${NC}                            ${BOLD}Remote / iPad${NC}
-  TMUX             ${CLAUDE_SAFE_TMUX}                      TMUX_CONF   ${CLAUDE_SAFE_TMUX_CONF:-<default>}
-  WORKTREE_DIR     ${CLAUDE_SAFE_WORKTREE_DIR}              NOTIFY      ${CLAUDE_SAFE_NOTIFY_CMD:-<none>}
-  TMUX_PREFIX      ${CLAUDE_SAFE_TMUX_PREFIX}
-  SETUP_HOOK       ${CLAUDE_SAFE_SETUP_HOOK}  confirm: ${CLAUDE_SAFE_SETUP_HOOK_CONFIRM}
-  CLAUDE_ARGS      ${CLAUDE_SAFE_CLAUDE_ARGS:-<none>}
-  PERMISSION_MODE  ${CLAUDE_SAFE_PERMISSION_MODE:-<none>}
-  AUTO_CLEANUP     ${CLAUDE_SAFE_AUTO_CLEANUP}   ${DIM}(remove container when last session exits)${NC}
-  VERSION_CHECK    ${CLAUDE_SAFE_VERSION_CHECK}   ${DIM}(warn if Claude Code version is outdated)${NC}
+  TMUX             ${CLAUDE_SAFE_TMUX}  $(_cfg_src CLAUDE_SAFE_TMUX)    TMUX_CONF   ${CLAUDE_SAFE_TMUX_CONF:-<default>}  $(_cfg_src CLAUDE_SAFE_TMUX_CONF)
+  WORKTREE_DIR     ${CLAUDE_SAFE_WORKTREE_DIR}  $(_cfg_src CLAUDE_SAFE_WORKTREE_DIR)    NOTIFY      ${CLAUDE_SAFE_NOTIFY_CMD:-<none>}  $(_cfg_src CLAUDE_SAFE_NOTIFY_CMD)
+  TMUX_PREFIX      ${CLAUDE_SAFE_TMUX_PREFIX}  $(_cfg_src CLAUDE_SAFE_TMUX_PREFIX)
+  SETUP_HOOK       ${CLAUDE_SAFE_SETUP_HOOK}  confirm: ${CLAUDE_SAFE_SETUP_HOOK_CONFIRM}  $(_cfg_src CLAUDE_SAFE_SETUP_HOOK)
+  CLAUDE_ARGS      ${CLAUDE_SAFE_CLAUDE_ARGS:-<none>}  $(_cfg_src CLAUDE_SAFE_CLAUDE_ARGS)
+  PERMISSION_MODE  ${CLAUDE_SAFE_PERMISSION_MODE:-<none>}  $(_cfg_src CLAUDE_SAFE_PERMISSION_MODE)
+  AUTO_CLEANUP     ${CLAUDE_SAFE_AUTO_CLEANUP}  $(_cfg_src CLAUDE_SAFE_AUTO_CLEANUP)   ${DIM}(remove container when last session exits)${NC}
+  VERSION_CHECK    ${CLAUDE_SAFE_VERSION_CHECK}  $(_cfg_src CLAUDE_SAFE_VERSION_CHECK)   ${DIM}(warn if Claude Code version is outdated)${NC}
 
 ${BOLD}Environment${NC}
-  HOST_ENV         ${CLAUDE_SAFE_HOST_ENV:-<none>}    ${DIM}(forwarded from host at runtime)${NC}
-  EXTRA_ENV        ${CLAUDE_SAFE_EXTRA_ENV:-<none>}   ${DIM}(static key=value)${NC}
+  HOST_ENV         ${CLAUDE_SAFE_HOST_ENV:-<none>}  $(_cfg_src CLAUDE_SAFE_HOST_ENV)   ${DIM}(forwarded from host at runtime)${NC}
+  EXTRA_ENV        ${CLAUDE_SAFE_EXTRA_ENV:-<none>}  $(_cfg_src CLAUDE_SAFE_EXTRA_ENV)   ${DIM}(static key=value)${NC}
 
 EOF
+}
+
+_generate_override_template() {
+    cat << 'TMPL'
+# .claude-safe/config — per-project override
+# Format: KEY=VALUE (declarative, no shell eval)
+# Only CLAUDE_SAFE_* keys are recognized. $HOME and ~/ are expanded.
+# CLAUDE_SAFE_NOTIFY_CMD is ignored here (global config only, for security).
+# Commit this file — it contains no credentials or executable code.
+
+# ── Sandbox ──────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_NETWORK=host
+# CLAUDE_SAFE_SANDBOX_MODE=docker
+
+# ── Mounts ───────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_MOUNT_KUBE=true
+# CLAUDE_SAFE_KUBE_PROFILES=
+# CLAUDE_SAFE_MOUNT_SSH=true
+# CLAUDE_SAFE_SSH_MODE=agent
+# CLAUDE_SAFE_RO_DIRS=$HOME/Code
+# CLAUDE_SAFE_RW_DIRS=
+# CLAUDE_SAFE_MOUNT_GITCONFIG=true
+# CLAUDE_SAFE_MOUNT_GH=true
+# CLAUDE_SAFE_MOUNT_TAILSCALE=false
+# CLAUDE_SAFE_DOCKER_SOCKET=false
+# CLAUDE_SAFE_DIRENV_AUTO_ALLOW=false
+# CLAUDE_SAFE_EXTRA_VOLUMES=
+
+# ── Environment ───────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_HOST_ENV=
+# CLAUDE_SAFE_EXTRA_ENV=
+
+# ── Resources ────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_MEMORY=
+# CLAUDE_SAFE_CPUS=
+
+# ── Worktree + tmux ───────────────────────────────────────────────────────────
+# CLAUDE_SAFE_TMUX=true
+# CLAUDE_SAFE_WORKTREE_DIR=.worktrees
+# CLAUDE_SAFE_TMUX_PREFIX=cs
+# CLAUDE_SAFE_SETUP_HOOK=.cmux/setup
+# CLAUDE_SAFE_SETUP_HOOK_CONFIRM=true
+
+# ── Claude ───────────────────────────────────────────────────────────────────
+# CLAUDE_SAFE_PERMISSION_MODE=
+# CLAUDE_SAFE_CLAUDE_ARGS=
+# CLAUDE_SAFE_VERSION_CHECK=true
+# CLAUDE_SAFE_AUTO_CLEANUP=true
+TMPL
+}
+
+cmd_custom() {
+    local subcmd="${1:-}"
+    local project_root; project_root="$(_repo_root 2>/dev/null)" || {
+        _error "Not in a git repository"; return 1; }
+    local override_file="${project_root}/.claude-safe/config"
+
+    case "$subcmd" in
+        --list|-l)
+            if [[ ! -f "$_TRUSTED_FILE" ]]; then
+                _info "No trusted project overrides."
+            else
+                echo -e "\n${BOLD}Trusted project overrides:${NC}"
+                while IFS= read -r p; do
+                    [[ -z "$p" ]] && continue
+                    if [[ -f "$p" ]]; then
+                        echo -e "  ${GREEN}✓${NC} $p"
+                    else
+                        echo -e "  ${DIM}✗ $p (file not found)${NC}"
+                    fi
+                done < "$_TRUSTED_FILE"
+                echo ""
+            fi
+            ;;
+        --path|-p)
+            echo "$override_file"
+            ;;
+        --rm)
+            if [[ -f "$override_file" ]]; then
+                rm -f "$override_file"
+                _info "Removed: $override_file"
+                rmdir "$(dirname "$override_file")" 2>/dev/null || true
+            else
+                _warn "No override file found: $override_file"
+            fi
+            _untrust_override "$override_file"
+            _info "Untrusted: $override_file"
+            ;;
+        "")
+            mkdir -p "$(dirname "$override_file")"
+            if [[ ! -f "$override_file" ]]; then
+                _generate_override_template > "$override_file"
+                chmod 644 "$override_file"
+                _info "Created: $override_file"
+            fi
+            _trust_override "$override_file"
+            _info "Trusted: $override_file"
+            local editor="${EDITOR:-vi}"
+            "$editor" "$override_file"
+            ;;
+        *)
+            _error "Unknown option: $subcmd"
+            echo "Usage: claude-safe custom [--list|--path|--rm]"
+            return 1
+            ;;
+    esac
 }
 
 cmd_doctor() {
@@ -1403,7 +1650,7 @@ cmd_doctor() {
     _ckw command -v claude; _ckw command -v mosh-server
     _ckw command -v kubectl; _ckw command -v helm; _ckw command -v k9s
     echo ""
-    [[ -f "$CONFIG_FILE" ]]             && echo -e "  ${GREEN}✓${NC} Config: ${CONFIG_FILE}"       || echo -e "  ${YELLOW}?${NC} No config"
+    [[ -n "${_GLOBAL_CONFIG_FILE:-}" ]]  && echo -e "  ${GREEN}✓${NC} Config: ${_GLOBAL_CONFIG_FILE}" || echo -e "  ${YELLOW}?${NC} No config"
     [[ -d "$CLAUDE_HOME" ]]             && echo -e "  ${GREEN}✓${NC} ~/.claude/"                   || echo -e "  ${RED}✗${NC} ~/.claude/"
     [[ -d "$HOME/.kube" ]]              && echo -e "  ${GREEN}✓${NC} ~/.kube/"                     || echo -e "  ${YELLOW}?${NC} ~/.kube/"
     [[ -d "$HOME/.ssh" ]]               && echo -e "  ${GREEN}✓${NC} ~/.ssh/"                      || echo -e "  ${YELLOW}?${NC} ~/.ssh/"
@@ -1558,6 +1805,23 @@ cmd_doctor() {
             ;;
     esac
 
+    # Project override check
+    local project_root; project_root="$(_repo_root 2>/dev/null || echo "")"
+    if [[ -n "$project_root" ]]; then
+        local override="${project_root}/.claude-safe/config"
+        if [[ -f "$override" ]]; then
+            if _is_trusted "$override"; then
+                echo -e "  ${GREEN}✓${NC} Project override: ${override} ${DIM}(trusted)${NC}"; ok=$((ok+1))
+            else
+                echo -e "  ${YELLOW}?${NC} Project override found but not trusted: ${override}"; w=$((w+1))
+                echo -e "     ${DIM}Run: claude-safe custom  to trust and load it${NC}"
+            fi
+        else
+            local project_name; project_name="$(basename "$project_root")"
+            echo -e "  ${DIM}  No project override for ${project_name}${NC}"
+        fi
+    fi
+
     echo -e "\n  ${ok} ok, ${w} warn, ${f} fail\n"
     [[ $f -eq 0 ]]
 }
@@ -1566,7 +1830,7 @@ cmd_doctor() {
 
 # Single definition — used both when sourced and emitted by --completions.
 _CS_COMP_BODY='_cs_comp() {
-    local cmds="new start ls rm merge shell stop dash install update config doctor tmux direct"
+    local cmds="new start ls rm merge shell stop dash install update config custom doctor tmux direct"
     local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
     case "$cmd" in
         start|rm|merge|shell|stop)
@@ -1614,7 +1878,8 @@ case "${1:-}" in
     dash)    cmd_dash ;;
     install) cmd_install ;;
     update)  cmd_update ;;
-    config)  cmd_config ;;
+    config)  shift; cmd_config "${1:-}" ;;
+    custom)  shift; cmd_custom "$@" ;;
     doctor)  cmd_doctor ;;
     tmux)    shift; cmd_tmux "$@" ;;
     direct)  shift; cmd_direct "$@" ;;
@@ -1663,7 +1928,8 @@ ${BOLD}LAUNCH MODES${NC}
 ${BOLD}SETUP${NC}
   install                 Interactive installer / reconfigure
   update [--no-cache]     Rebuild Docker image
-  config                  Show current configuration
+  config [--migrate]      Show current configuration / migrate config.sh
+  custom [--list|--rm]    Manage per-project config overrides
   doctor                  Verify setup
 
 ${DIM}Tip: CLAUDE_SAFE_TMUX=false in config to always launch without tmux${NC}
