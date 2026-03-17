@@ -23,7 +23,7 @@ jobs:
         run: shellcheck -S error claude-safe config.example.sh
 
       - name: Hadolint (Dockerfile lint)
-        uses: hadolint/hadolint-action@v3.1.0
+        uses: hadolint/hadolint-action@2332a7b74a6de0dda2e2221d575162eba76ba5e5 # v3.3.0
         with:
           dockerfile: Dockerfile.claude-safe
           failure-threshold: warning
