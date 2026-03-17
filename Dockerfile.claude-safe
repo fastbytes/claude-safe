@@ -1,11 +1,11 @@
 # claude-safe custom template — K8s + DevOps + general development tools
-# Base: docker/sandbox-templates:claude-code (includes Node.js, Python, Go, Git, Docker CLI, grep, sed, awk, curl)
+# Base: docker/sandbox-templates:shell (includes Node.js, Python, Go, Git, Docker CLI, grep, sed, awk, curl)
 # Adds: K8s toolchain, search tools, build essentials, GitHub CLI, postgres client, network tools
 #
 # Build:  docker build -t claude-safe -f Dockerfile.claude-safe .
 # Works on both arm64 (Apple Silicon / OrbStack) and amd64
 
-FROM docker/sandbox-templates:claude-code
+FROM docker/sandbox-templates:shell
 USER root
 
 # Detect architecture once — reuse in all RUN steps
@@ -239,10 +239,8 @@ ENV DIRENV_CONFIG=/etc/direnv
 # ── grml vim config ──
 RUN curl -fsSL https://git.grml.org/f/grml-etc-core/etc/vim/vimrc -o /etc/vim/vimrc.local
 
-# ── Ensure latest Claude Code (base image may lag npm releases) ──
+# ── Install Claude Code ──
 ARG CLAUDE_CODE_CACHEBUST=0
-RUN npm uninstall -g @anthropic-ai/claude-code \
- && npm cache clean --force \
- && npm install -g @anthropic-ai/claude-code@latest
+RUN npm install -g @anthropic-ai/claude-code@latest
 
 USER agent

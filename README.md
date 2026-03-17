@@ -157,7 +157,7 @@ Host environment variables listed in `CLAUDE_SAFE_HOST_ENV` are forwarded via `d
 
 ## Container image
 
-`Dockerfile.claude-safe` extends `docker/sandbox-templates:claude-code` with:
+`Dockerfile.claude-safe` extends `docker/sandbox-templates:shell` with:
 
 - **K8s:** kubectl, helm, k9s, stern, yq
 - **Dev:** ripgrep, fd, shellcheck, build-essential, gh, delta
