@@ -47,6 +47,12 @@ CLAUDE_SAFE_MOUNT_CLAUDE=true
 # Mount ~/.ssh (read-only) for git operations over SSH
 CLAUDE_SAFE_MOUNT_SSH=true
 
+# SSH access mode (requires CLAUDE_SAFE_MOUNT_SSH=true)
+# - "agent" (default): Forward SSH_AUTH_SOCK only + mount config/known_hosts read-only
+#             Exposes signing capability only — private keys never enter container
+# - "keys": Mount entire ~/.ssh read-only (legacy behavior, exposes private keys)
+CLAUDE_SAFE_SSH_MODE="agent"
+
 # Read-only directories mounted at /home/agent/<basename> (colon-separated)
 # Example: "$HOME/Code:$HOME/Work:$HOME/go/src"
 CLAUDE_SAFE_RO_DIRS="$HOME/Code"
@@ -67,10 +73,15 @@ CLAUDE_SAFE_MOUNT_GH=true
 CLAUDE_SAFE_MOUNT_TAILSCALE=false
 
 # Mount Docker socket for Docker-in-Docker workflows
-# ⚠️  WARNING: This gives the container full control over the host's Docker daemon
-# Only enable for projects that need docker/docker-compose commands
-# Security note: Reduces isolation. Container can manage all host containers.
+# Options: false (default), proxy, true
+#   false  — no Docker access from container
+#   proxy  — filtered API access via socket proxy (recommended if needed)
+#            Allows: build, images, containers, volumes, networks
+#            Blocks: exec, auth, swarm, system, secrets, plugins
+#   true   — full socket mount (requires CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM=true)
+#            ⚠️  WARNING: full host root access — container can escape sandbox
 CLAUDE_SAFE_DOCKER_SOCKET=false
+# CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM=true  # required when DOCKER_SOCKET=true
 
 # Auto-allow direnv .envrc files without requiring 'direnv allow'
 # Safe inside containers since the container IS the sandbox
@@ -185,3 +196,8 @@ CLAUDE_SAFE_AUTO_CLEANUP=true
 # Default 86400 = once per day. Fast no-op if Dockerfile hasn't changed.
 # Set to 0 to rebuild every launch, or -1 to never auto-build.
 CLAUDE_SAFE_BUILD_INTERVAL=86400
+
+# Check for Claude Code version updates at new session creation
+# Compares installed version against npm registry; warns if stale.
+# Disable if you're offline or want to skip the network check.
+CLAUDE_SAFE_VERSION_CHECK=true
