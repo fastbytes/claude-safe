@@ -20,12 +20,7 @@ jobs:
         run: bash -n claude-safe
 
       - name: ShellCheck
-        uses: ludeeus/action-shellcheck@master
-        with:
-          scandir: "."
-          additional_files: "claude-safe"
-          severity: error
-          ignore_paths: "Dockerfile.claude-safe"
+        run: shellcheck -S error claude-safe config.example.sh
 
       - name: Hadolint (Dockerfile lint)
         uses: hadolint/hadolint-action@v3.1.0
