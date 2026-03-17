@@ -1,0 +1,82 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests"
+  ],
+  "labels": ["dependencies"],
+  "dependencyDashboard": true,
+  "dependencyDashboardTitle": "Renovate Dependency Dashboard",
+  "packageRules": [
+    {
+      "description": "Auto-merge Dockerfile tool minor + patch updates via PR",
+      "matchFileNames": ["Dockerfile.claude-safe"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Auto-merge GitHub Actions minor + patch updates",
+      "matchManagers": ["github-actions"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Claude Code version update — triggers a tagged release",
+      "matchFileNames": [".github/CLAUDE_CODE_VERSION"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true,
+      "commitMessageTopic": "Claude Code to {{newVersion}}",
+      "labels": ["dependencies", "claude-code-update"]
+    },
+    {
+      "description": "wscat npm dependency in Dockerfile",
+      "matchFileNames": ["Dockerfile.claude-safe"],
+      "matchPackageNames": ["wscat"],
+      "automerge": true,
+      "automergeType": "pr",
+      "platformAutomerge": true
+    },
+    {
+      "description": "Major updates require manual review",
+      "matchUpdateTypes": ["major"],
+      "automerge": false,
+      "labels": ["dependencies", "major-update"]
+    }
+  ],
+  "customManagers": [
+    {
+      "description": "Dockerfile ARG versions annotated with # renovate: comments",
+      "customType": "regex",
+      "fileMatch": ["^Dockerfile\\.claude-safe$"],
+      "matchStrings": [
+        "# renovate: datasource=(?<datasource>[a-z-]+) depName=(?<depName>[^\\s]+)(?:\\s+versioning=(?<versioning>[^\\n]+))?\\nARG [A-Z_]+(?:_VER(?:SION)?)=(?<currentValue>v?[\\d][\\d.]*)"
+      ]
+    },
+    {
+      "description": "wscat npm install in Dockerfile",
+      "customType": "regex",
+      "fileMatch": ["^Dockerfile\\.claude-safe$"],
+      "matchStrings": [
+        "npm install -g wscat@(?<currentValue>[\\d.]+)"
+      ],
+      "depNameTemplate": "wscat",
+      "datasourceTemplate": "npm"
+    },
+    {
+      "description": "Claude Code version tracking — CLAUDE_CODE_VERSION file",
+      "customType": "regex",
+      "fileMatch": ["^\\.github/CLAUDE_CODE_VERSION$"],
+      "matchStrings": [
+        "^(?<currentValue>[\\d.]+)\\n?$"
+      ],
+      "depNameTemplate": "@anthropic-ai/claude-code",
+      "datasourceTemplate": "npm",
+      "versioningTemplate": "semver"
+    }
+  ]
+}

@@ -12,27 +12,49 @@ USER root
 # TARGETARCH is set by BuildKit (arm64 or amd64)
 ARG TARGETARCH
 
-# ── Tool versions — update these to upgrade ──
+# ── Tool versions — managed by Renovate, do not edit manually ──
+# renovate: datasource=github-releases depName=kubernetes/kubernetes
 ARG KUBECTL_VERSION=v1.35.2
+# renovate: datasource=github-releases depName=helm/helm
 ARG HELM_VERSION=v4.1.3
+# renovate: datasource=github-releases depName=derailed/k9s
 ARG K9S_VERSION=v0.50.18
+# renovate: datasource=github-releases depName=stern/stern
 ARG STERN_VERSION=v1.33.1
+# renovate: datasource=github-releases depName=mikefarah/yq
 ARG YQ_VERSION=v4.52.4
+# renovate: datasource=github-releases depName=cli/cli
 ARG GH_VERSION=v2.88.1
+# renovate: datasource=github-releases depName=dandavison/delta
 ARG DELTA_VERSION=0.18.2
+# renovate: datasource=github-releases depName=sharkdp/bat
 ARG BAT_VERSION=v0.26.1
+# renovate: datasource=github-releases depName=vi/websocat
 ARG WEBSOCAT_VERSION=v1.14.1
+# renovate: datasource=github-releases depName=ducaale/xh
 ARG XH_VERSION=v0.25.3
+# renovate: datasource=github-releases depName=FiloSottile/age
 ARG AGE_VERSION=v1.3.1
+# renovate: datasource=github-releases depName=getsops/sops
 ARG SOPS_VERSION=v3.12.1
+# renovate: datasource=github-releases depName=fullstorydev/grpcurl
 ARG GRPCURL_VERSION=v1.9.3
+# renovate: datasource=github-releases depName=ahmetb/kubectx
 ARG KUBECTX_VERSION=v0.9.5
+# renovate: datasource=github-releases depName=schollz/croc
 ARG CROC_VERSION=v10.4.2
+# renovate: datasource=github-releases depName=FiloSottile/mkcert
 ARG MKCERT_VERSION=v1.4.4
+# renovate: datasource=github-releases depName=go-task/task
 ARG TASK_VERSION=v3.49.1
+# renovate: datasource=github-releases depName=casey/just
 ARG JUST_VERSION=1.47.1
+# renovate: datasource=github-releases depName=projectdiscovery/httpx
 ARG HTTPX_VERSION=v1.9.0
+# renovate: datasource=github-releases depName=jesseduffield/lazygit
 ARG LAZYGIT_VERSION=v0.60.0
+# renovate: datasource=github-releases depName=kubernetes-sigs/kustomize versioning=regex:^kustomize/v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$
+ARG KUSTOMIZE_VERSION=5.8.1
 
 # Use bash for all RUN steps (needed for pids+=() array syntax in parallel block)
 SHELL ["/bin/bash", "-c"]
@@ -159,9 +181,8 @@ RUN set -e; \
     ; } & pids+=($!); \
     \
     # kustomize
-    { KUSTOMIZE_VER=5.8.1 \
-      && curl -fsSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/kustomize/v${KUSTOMIZE_VER}/hack/install_kustomize.sh" \
-         | bash /dev/stdin "${KUSTOMIZE_VER}" /usr/local/bin \
+    { curl -fsSL "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/kustomize/v${KUSTOMIZE_VERSION}/hack/install_kustomize.sh" \
+         | bash /dev/stdin "${KUSTOMIZE_VERSION}" /usr/local/bin \
     ; } & pids+=($!); \
     \
     # croc (file transfer)
