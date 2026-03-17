@@ -5,6 +5,7 @@ on:
     branches: [main]
     paths:
       - .github/CLAUDE_CODE_VERSION
+  workflow_dispatch:
 
 permissions:
   contents: write
