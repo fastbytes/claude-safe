@@ -85,13 +85,15 @@ CLAUDE_SAFE_DOCKER_SOCKET=false
 # CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM=true  # required when DOCKER_SOCKET=true
 
 # Auto-allow direnv .envrc files without requiring 'direnv allow'
-# Safe inside containers since the container IS the sandbox
-# Set to false to require explicit 'direnv allow' per directory
-CLAUDE_SAFE_DIRENV_AUTO_ALLOW=true
+# Default false: untrusted repos could use .envrc to run arbitrary code
+# Set to true if you trust all repos you open (container IS the sandbox)
+CLAUDE_SAFE_DIRENV_AUTO_ALLOW=false
 
 # Additional volume mounts (space-separated)
 # Format: "host_path:container_path:mode host_path2:container_path2:mode"
 # Example: "$HOME/.npm:/home/agent/.npm:ro $HOME/.cache:/home/agent/.cache:rw"
+# NOTE: These bypass normal mount restrictions — review paths carefully.
+# Mounting sensitive paths (e.g., ~/.ssh, /etc) gives container full read access.
 CLAUDE_SAFE_EXTRA_VOLUMES=""
 
 # ────────────────────────────────────────────────────────────────────────────
@@ -142,6 +144,9 @@ CLAUDE_SAFE_TMUX_PREFIX="cs"
 # Path relative to project root. Runs inside container before launching claude.
 # Example: ".cmux/setup" could install deps, start services, etc.
 CLAUDE_SAFE_SETUP_HOOK=".cmux/setup"
+# Prompt for confirmation before executing setup hooks (default: true)
+# Set to false to auto-execute without prompting (only if you trust all repos)
+CLAUDE_SAFE_SETUP_HOOK_CONFIRM=true
 
 # ────────────────────────────────────────────────────────────────────────────
 # Claude Configuration

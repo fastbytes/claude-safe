@@ -50,7 +50,7 @@ SELF="$(realpath "${BASH_SOURCE[0]}")"
 : "${CLAUDE_SAFE_MOUNT_TAILSCALE:=false}"
 : "${CLAUDE_SAFE_DOCKER_SOCKET:=false}"
 : "${CLAUDE_SAFE_DOCKER_SOCKET_CONFIRM:=false}"
-: "${CLAUDE_SAFE_DIRENV_AUTO_ALLOW:=true}"
+: "${CLAUDE_SAFE_DIRENV_AUTO_ALLOW:=false}"
 : "${CLAUDE_SAFE_EXTRA_VOLUMES:=}"
 
 # Space-separated env var NAMES to forward from host into container (secrets/credentials)
@@ -82,12 +82,15 @@ CLAUDE_COW_FILES=(settings.json)
 : "${CLAUDE_SAFE_WORKTREE_DIR:=.worktrees}"
 : "${CLAUDE_SAFE_TMUX_PREFIX:=cs}"
 : "${CLAUDE_SAFE_SETUP_HOOK:=.cmux/setup}"
+: "${CLAUDE_SAFE_SETUP_HOOK_CONFIRM:=true}"
 : "${CLAUDE_SAFE_CLAUDE_ARGS:=}"
 : "${CLAUDE_SAFE_PERMISSION_MODE:=}"
 
 : "${CLAUDE_SAFE_TMUX_CONF:=}"
 : "${CLAUDE_SAFE_CONTAINER_TMUX_CONF:=/etc/tmux.conf}"
-: "${CLAUDE_SAFE_NOTIFY_CMD:=}"
+# NOTIFY_CMD is intentionally not set from env here — it runs on the host with
+# full privileges, so it must only come from the config file (ownership-checked).
+# The env var is unset in _load_config before sourcing config.sh.
 : "${CLAUDE_SAFE_AUTO_CLEANUP:=true}"
 : "${CLAUDE_SAFE_BUILD_INTERVAL:=86400}"  # seconds between image builds (0=always, -1=never)
 : "${CLAUDE_SAFE_VERSION_CHECK:=true}"
@@ -120,6 +123,12 @@ _load_config() {
     _init_config
     [[ -f "$CONFIG_FILE" ]] || return 0
 
+    # Reject symlinks to prevent bypassing ownership/permission checks
+    if [[ -L "$CONFIG_FILE" ]]; then
+        _warn "Config file is a symlink — skipping: $CONFIG_FILE"
+        return 0
+    fi
+
     # Verify ownership and permissions before sourcing to prevent config poisoning.
     # File must be owned by current user and not group/world-writable.
     local _owner _perms
@@ -140,8 +149,14 @@ _load_config() {
         return 0
     fi
 
+    # NOTIFY_CMD runs on the host with full privileges — only honor values from
+    # the ownership-checked config file, never from inherited environment.
+    unset CLAUDE_SAFE_NOTIFY_CMD
+
     # shellcheck source=/dev/null
     source "$CONFIG_FILE"
+
+    : "${CLAUDE_SAFE_NOTIFY_CMD:=}"
 }
 
 # ─── Helpers ─────────────────────────────────────────────────────────────────
@@ -180,8 +195,17 @@ _auto_setup_container() {
     # Container-side setup: runs inside the sandbox before Claude starts.
     local container="$1" wt_path="$2"
 
-    # Escape hatch: explicit setup script takes priority
+    # Escape hatch: explicit setup script takes priority.
+    # Prompt for confirmation to prevent untrusted repos from auto-executing hooks
+    # that could exfiltrate mounted credentials (OAuth, GitHub tokens, kubeconfig).
     if docker exec -w "$wt_path" "$container" test -x "./${CLAUDE_SAFE_SETUP_HOOK}" 2>/dev/null; then
+        if [[ "${CLAUDE_SAFE_SETUP_HOOK_CONFIRM:-true}" == "true" ]]; then
+            _warn "Setup hook found: ${CYAN}${CLAUDE_SAFE_SETUP_HOOK}${NC}"
+            if ! _ask_yn "Execute setup hook?" "n"; then
+                _info "Skipped setup hook"
+                return
+            fi
+        fi
         _info "Setup: ${CLAUDE_SAFE_SETUP_HOOK}"
         docker exec -w "$wt_path" "$container" bash -c "./${CLAUDE_SAFE_SETUP_HOOK}"
         return
@@ -263,14 +287,25 @@ _ensure_claude_rw_dirs() {
 
 _prepare_cow_staging() {
     # Copy protected files/dirs to staging. Container mounts copies, not originals.
-    local cow_dir="${CONFIG_DIR}/.cow-staging"
-    mkdir -p "$cow_dir" && chmod 700 "$cow_dir"
+    # Use a randomized path to prevent TOCTOU attacks on a predictable fixed path.
+    _COW_STAGING_DIR="$(mktemp -d "${CONFIG_DIR}/.cow-staging.XXXXXX")"
+    chmod 700 "$_COW_STAGING_DIR"
+    local cow_dir="$_COW_STAGING_DIR"
 
     # COW dirs — cp -a preserves structure
     for d in "${CLAUDE_COW_DIRS[@]}"; do
         if [[ -d "${CLAUDE_HOME}/${d}" ]]; then
             rm -rf "${cow_dir:?}/${d}" 2>/dev/null || true
             cp -a "${CLAUDE_HOME}/${d}" "${cow_dir}/${d}"
+            # Remove symlinks pointing outside CLAUDE_HOME to prevent
+            # exfiltrating sensitive files (e.g., ~/.ssh/id_rsa) via mount
+            while IFS= read -r -d '' _link; do
+                local _target
+                _target="$(readlink -f "$_link" 2>/dev/null || true)"
+                if [[ -n "$_target" ]] && [[ "$_target" != "${CLAUDE_HOME}"/* ]]; then
+                    rm -f "$_link"
+                fi
+            done < <(find "${cow_dir}/${d}" -type l -print0 2>/dev/null)
         else
             mkdir -p "${cow_dir}/${d}"
         fi
@@ -300,7 +335,7 @@ _add_claude_mounts() {
     [[ "$CLAUDE_SAFE_MOUNT_CLAUDE" == "true" ]] || return 0
     _ensure_claude_rw_dirs
     local p="/home/agent/.claude"
-    local cow_dir="${CONFIG_DIR}/.cow-staging"
+    local cow_dir="${_COW_STAGING_DIR:-${CONFIG_DIR}/.cow-staging}"
 
     # 1. Base: entire ~/.claude READ-ONLY
     cmd+=("-v" "${CLAUDE_HOME}:${p}:ro")
@@ -443,7 +478,9 @@ _stop_container() {
     _container_exists "$name" && docker rm -f "$name" &>/dev/null
     docker rm -f "cs-socket-proxy-${name}" &>/dev/null || true
     rm -f "${CLAUDE_HOME}/.credentials.json"
-    rm -rf "${CONFIG_DIR}/.cow-staging" 2>/dev/null || true
+    if [[ -n "${_COW_STAGING_DIR:-}" ]]; then
+        rm -rf "$_COW_STAGING_DIR" 2>/dev/null || true
+    fi
 }
 
 # ─── Launch backends ────────────────────────────────────────────────────────
@@ -492,7 +529,7 @@ _start_socket_proxy() {
         -e TASKS=0 \
         -e PLUGINS=0 \
         -e SYSTEM=0 \
-        tecnativa/docker-socket-proxy:latest >/dev/null
+        tecnativa/docker-socket-proxy:0.3.0@sha256:9e4b9e7517a6b660f2cc903a19b257b1852d5b3344794e3ea334ff00ae677ac2 >/dev/null
 
     _info "Docker socket proxy started (filtered API access)"
 }
@@ -816,6 +853,9 @@ _migrate_config() {
 
     # SSH agent mode (default: agent — forward SSH_AUTH_SOCK, don't expose keys)
     _cfg_add_if_missing "CLAUDE_SAFE_SSH_MODE" '"agent"'
+
+    # Setup hook confirmation (default: true — prompt before executing .cmux/setup)
+    _cfg_add_if_missing "CLAUDE_SAFE_SETUP_HOOK_CONFIRM" "true"
 
     $changed
 }
@@ -1299,6 +1339,11 @@ cmd_update() {
 
     # Self-update: copy current script to the installed location (if we're running from elsewhere)
     local install_bin="${CLAUDE_SAFE_INSTALL_BIN:-$HOME/.local/bin/claude-safe}"
+    install_bin="$(realpath "$install_bin" 2>/dev/null || echo "$install_bin")"
+    if [[ "$install_bin" != "$HOME"/* ]]; then
+        _error "CLAUDE_SAFE_INSTALL_BIN must be within \$HOME. Got: $install_bin"
+        return 1
+    fi
     if [[ "$SELF" != "$install_bin" ]] && [[ -f "$install_bin" ]]; then
         _info "Updating script: ${CYAN}${install_bin}${NC}"
         cp "$SELF" "$install_bin"
@@ -1335,7 +1380,7 @@ ${BOLD}Worktree + tmux${NC}                            ${BOLD}Remote / iPad${NC}
   TMUX             ${CLAUDE_SAFE_TMUX}                      TMUX_CONF   ${CLAUDE_SAFE_TMUX_CONF:-<default>}
   WORKTREE_DIR     ${CLAUDE_SAFE_WORKTREE_DIR}              NOTIFY      ${CLAUDE_SAFE_NOTIFY_CMD:-<none>}
   TMUX_PREFIX      ${CLAUDE_SAFE_TMUX_PREFIX}
-  SETUP_HOOK       ${CLAUDE_SAFE_SETUP_HOOK}
+  SETUP_HOOK       ${CLAUDE_SAFE_SETUP_HOOK}  confirm: ${CLAUDE_SAFE_SETUP_HOOK_CONFIRM}
   CLAUDE_ARGS      ${CLAUDE_SAFE_CLAUDE_ARGS:-<none>}
   PERMISSION_MODE  ${CLAUDE_SAFE_PERMISSION_MODE:-<none>}
   AUTO_CLEANUP     ${CLAUDE_SAFE_AUTO_CLEANUP}   ${DIM}(remove container when last session exits)${NC}
@@ -1540,6 +1585,18 @@ fi
 # ─── Main ────────────────────────────────────────────────────────────────────
 
 _load_config
+
+# Cleanup credentials and staging on any exit (normal, Ctrl-C, SIGTERM, set -e).
+# Without this, OAuth tokens and COW staging copies persist after abnormal exits.
+_cleanup_on_exit() {
+    rm -f "${CLAUDE_HOME}/.credentials.json" 2>/dev/null || true
+    if [[ -n "${_COW_STAGING_DIR:-}" ]]; then
+        rm -rf "$_COW_STAGING_DIR" 2>/dev/null || true
+    else
+        rm -rf "${CONFIG_DIR}/.cow-staging" 2>/dev/null || true
+    fi
+}
+trap _cleanup_on_exit EXIT
 
 if [[ "${1:-}" == "--dangerous" ]]; then
     CLAUDE_SAFE_PERMISSION_MODE="bypass"
