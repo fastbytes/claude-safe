@@ -57,7 +57,7 @@ ARG LAZYGIT_VERSION=v0.60.0
 ARG KUSTOMIZE_VERSION=5.8.1
 
 # Use bash for all RUN steps (needed for pids+=() array syntax in parallel block)
-SHELL ["/bin/bash", "-c"]
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
 # ── System packages ──
 RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
@@ -222,6 +222,7 @@ RUN set -e; \
     exit_code=0; for pid in "${pids[@]}"; do wait "$pid" || exit_code=$?; done; exit "$exit_code"
 
 # ── grml zsh config + ~/.zshrc.d/ support ──
+# hadolint ignore=SC2016
 RUN curl -fsSL https://git.grml.org/f/grml-etc-core/etc/zsh/zshrc -o /etc/zsh/zshrc \
     && printf '\n# Source ~/.zshrc.d/ drop-ins\nif [[ -d "${ZDOTDIR:-$HOME}/.zshrc.d" ]]; then\n  for _f in "${ZDOTDIR:-$HOME}"/.zshrc.d/*.{sh,zsh}(N); do\n    source "$_f"\n  done\nfi\n' \
        >> /etc/zsh/zshrc \
