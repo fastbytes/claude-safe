@@ -62,13 +62,18 @@ SELF="$(realpath "${BASH_SOURCE[0]}")"
 CLAUDE_HOME="${HOME}/.claude"
 CLAUDE_JSON="${HOME}/.claude.json"
 
-# ~/.claude subdirs that need WRITE (session state, plans, runtime)
-CLAUDE_RW_DIRS=(projects plans todos file-history session-env shell-snapshots debug statsig ide telemetry teams)
-# ~/.claude files that need WRITE
-CLAUDE_RW_FILES=(history.jsonl stats-cache.json)
+# ~/.claude subdirs — WRITE-THROUGH (session data persists to host)
+CLAUDE_RW_DIRS=(projects plans todos file-history session-env shell-snapshots debug statsig ide telemetry teams sessions backups tasks)
+# ~/.claude subdirs — COPY-ON-WRITE (readable from host, writes stay in container)
+CLAUDE_COW_DIRS=(plugins output-styles cache paste-cache status_lines downloads)
+# ~/.claude files — WRITE-THROUGH
+CLAUDE_RW_FILES=(history.jsonl stats-cache.json mcp-needs-auth-cache.json)
+# ~/.claude files — COPY-ON-WRITE
+CLAUDE_COW_FILES=(settings.json)
 # .credentials.json is handled separately (Keychain extraction on macOS)
-# Everything else (settings.json, CLAUDE.md, commands/, skills/, agents/, .credentials.json)
+# Everything else (CLAUDE.md, commands/, skills/, agents/, hooks/)
 # stays READ-ONLY via the base mount.
+# settings.json, .claude.json, and COW dirs are copy-on-write (host originals untouched).
 
 : "${CLAUDE_SAFE_MEMORY:=}"
 : "${CLAUDE_SAFE_CPUS:=}"
@@ -249,9 +254,35 @@ _current_worktree_branch() {
 
 _ensure_claude_rw_dirs() {
     for d in "${CLAUDE_RW_DIRS[@]}"; do mkdir -p "${CLAUDE_HOME}/${d}"; done
+    for d in "${CLAUDE_COW_DIRS[@]}"; do mkdir -p "${CLAUDE_HOME}/${d}"; done
     for f in "${CLAUDE_RW_FILES[@]}"; do touch "${CLAUDE_HOME}/${f}" 2>/dev/null || true; done
+    for f in "${CLAUDE_COW_FILES[@]}"; do touch "${CLAUDE_HOME}/${f}" 2>/dev/null || true; done
     # Ensure .credentials.json exists (needed as mount target) but mounted separately
     touch "${CLAUDE_HOME}/.credentials.json" 2>/dev/null || true
+}
+
+_prepare_cow_staging() {
+    # Copy protected files/dirs to staging. Container mounts copies, not originals.
+    local cow_dir="${CONFIG_DIR}/.cow-staging"
+    mkdir -p "$cow_dir" && chmod 700 "$cow_dir"
+
+    # COW dirs — cp -a preserves structure
+    for d in "${CLAUDE_COW_DIRS[@]}"; do
+        if [[ -d "${CLAUDE_HOME}/${d}" ]]; then
+            rm -rf "${cow_dir:?}/${d}" 2>/dev/null || true
+            cp -a "${CLAUDE_HOME}/${d}" "${cow_dir}/${d}"
+        else
+            mkdir -p "${cow_dir}/${d}"
+        fi
+    done
+
+    # COW files
+    for f in "${CLAUDE_COW_FILES[@]}"; do
+        [[ -f "${CLAUDE_HOME}/${f}" ]] && cp -f "${CLAUDE_HOME}/${f}" "${cow_dir}/${f}"
+    done
+
+    # ~/.claude.json (lives outside ~/.claude/)
+    [[ -f "$CLAUDE_JSON" ]] && cp -f "$CLAUDE_JSON" "${cow_dir}/claude.json"
 }
 
 _notify() {
@@ -269,22 +300,33 @@ _add_claude_mounts() {
     [[ "$CLAUDE_SAFE_MOUNT_CLAUDE" == "true" ]] || return 0
     _ensure_claude_rw_dirs
     local p="/home/agent/.claude"
+    local cow_dir="${CONFIG_DIR}/.cow-staging"
 
     # 1. Base: entire ~/.claude READ-ONLY
     cmd+=("-v" "${CLAUDE_HOME}:${p}:ro")
 
-    # 2. Overlay writable dirs on top (Docker deeper-mount overrides parent)
+    # 2. Overlay writable dirs (writes persist to host)
     for d in "${CLAUDE_RW_DIRS[@]}"; do
         [[ -d "${CLAUDE_HOME}/${d}" ]] && cmd+=("-v" "${CLAUDE_HOME}/${d}:${p}/${d}")
     done
 
-    # 3. Overlay writable files
+    # 3. Overlay COW dirs (writes stay in container)
+    for d in "${CLAUDE_COW_DIRS[@]}"; do
+        [[ -d "${cow_dir}/${d}" ]] && cmd+=("-v" "${cow_dir}/${d}:${p}/${d}")
+    done
+
+    # 4. Overlay writable files (writes persist to host)
     for f in "${CLAUDE_RW_FILES[@]}"; do
         [[ -f "${CLAUDE_HOME}/${f}" ]] && cmd+=("-v" "${CLAUDE_HOME}/${f}:${p}/${f}")
     done
 
-    # 4. ~/.claude.json (MCP config + runtime counters) — read-only (prevent MCP config poisoning)
-    [[ -f "$CLAUDE_JSON" ]] && cmd+=("-v" "${CLAUDE_JSON}:/home/agent/.claude.json:ro")
+    # 5. Overlay COW files (writes stay in container)
+    for f in "${CLAUDE_COW_FILES[@]}"; do
+        [[ -f "${cow_dir}/${f}" ]] && cmd+=("-v" "${cow_dir}/${f}:${p}/${f}")
+    done
+
+    # 6. ~/.claude.json — COW (runtime counters, bypass acceptance)
+    [[ -f "${cow_dir}/claude.json" ]] && cmd+=("-v" "${cow_dir}/claude.json:/home/agent/.claude.json")
 }
 
 _build_filtered_kubeconfig() {
@@ -401,6 +443,7 @@ _stop_container() {
     _container_exists "$name" && docker rm -f "$name" &>/dev/null
     docker rm -f "cs-socket-proxy-${name}" &>/dev/null || true
     rm -f "${CLAUDE_HOME}/.credentials.json"
+    rm -rf "${CONFIG_DIR}/.cow-staging" 2>/dev/null || true
 }
 
 # ─── Launch backends ────────────────────────────────────────────────────────
@@ -577,6 +620,7 @@ _start_container() {
 
     _stop_container "$name"
     _inject_keychain_creds || true
+    _prepare_cow_staging
 
     _maybe_build_image "$image"
 
@@ -598,6 +642,7 @@ _launch_docker() {
 
     _stop_container "$name"
     _inject_keychain_creds || true
+    _prepare_cow_staging
 
     _maybe_build_image "$image"
 
@@ -1071,6 +1116,7 @@ cmd_shell() {
         _dim "→ starting ephemeral container"
         local image="${CLAUDE_SAFE_TEMPLATE:-claude-safe}"
         _inject_keychain_creds || true
+        _prepare_cow_staging
         _maybe_build_image "$image"
         local cmd=(docker run --rm -it)
         _add_docker_args "$wt_path" "${name}-shell"
