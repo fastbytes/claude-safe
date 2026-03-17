@@ -200,12 +200,13 @@ _build_claude_cmd() {
     # Populates _cmd_parts array (dynamic scoping, same pattern as _add_docker_args).
     # Caller appends extra args to _cmd_parts, then uses them.
     _cmd_parts=("claude")
-    [[ "$CLAUDE_SAFE_PERMISSION_MODE" == "bypass" ]] \
-        && _cmd_parts+=(--dangerously-skip-permissions --allow-dangerously-skip-permissions)
-    [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]] && {
+    if [[ "$CLAUDE_SAFE_PERMISSION_MODE" == "bypass" ]]; then
+        _cmd_parts+=(--dangerously-skip-permissions --allow-dangerously-skip-permissions)
+    fi
+    if [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]]; then
         local _ca_split; read -ra _ca_split <<< "$CLAUDE_SAFE_CLAUDE_ARGS"
         _cmd_parts+=("${_ca_split[@]}")
-    }
+    fi
 }
 
 _create_tmux_in_container() {
@@ -375,7 +376,9 @@ _add_volume_args() {
     fi
 
     # Extra user volumes
-    [[ -n "$CLAUDE_SAFE_EXTRA_VOLUMES" ]] && for v in $CLAUDE_SAFE_EXTRA_VOLUMES; do cmd+=("-v" "$v"); done
+    if [[ -n "$CLAUDE_SAFE_EXTRA_VOLUMES" ]]; then
+        for v in $CLAUDE_SAFE_EXTRA_VOLUMES; do cmd+=("-v" "$v"); done
+    fi
 }
 
 # ─── Container lifecycle ───────────────────────────────────────────────────
@@ -503,8 +506,9 @@ _add_docker_args() {
         && cmd+=(-v "${CLAUDE_HOME}/.credentials.json:/home/agent/.claude/.credentials.json:ro")
 
     # tmux config inside container
-    [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]] \
-        && cmd+=(-v "${CLAUDE_SAFE_TMUX_CONF}:${CLAUDE_SAFE_CONTAINER_TMUX_CONF}:ro")
+    if [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]]; then
+        cmd+=(-v "${CLAUDE_SAFE_TMUX_CONF}:${CLAUDE_SAFE_CONTAINER_TMUX_CONF}:ro")
+    fi
 }
 
 _check_claude_version() {
@@ -602,7 +606,7 @@ _launch_docker() {
 
     cmd+=("$image")
     _build_claude_cmd
-    [[ ${#ca[@]} -gt 0 ]] && _cmd_parts+=("${ca[@]}")
+    if [[ ${#ca[@]} -gt 0 ]]; then _cmd_parts+=("${ca[@]}"); fi
     cmd+=("${_cmd_parts[@]}")
 
     _dim "→ ${cmd[*]}"
@@ -625,7 +629,7 @@ _launch_docker_sandbox() {
     _add_volume_args
 
     _build_claude_cmd
-    [[ ${#ca[@]} -gt 0 ]] && _cmd_parts+=("${ca[@]}")
+    if [[ ${#ca[@]} -gt 0 ]]; then _cmd_parts+=("${ca[@]}"); fi
     cmd+=("${_cmd_parts[@]}")
 
     _dim "→ ${cmd[*]}"
@@ -635,7 +639,7 @@ _launch_docker_sandbox() {
 _launch_none() {
     local workspace="$1"; shift; cd "$workspace"
     _build_claude_cmd
-    [[ $# -gt 0 ]] && _cmd_parts+=("$@")
+    if [[ $# -gt 0 ]]; then _cmd_parts+=("$@"); fi
     exec "${_cmd_parts[@]}"
 }
 
@@ -679,7 +683,7 @@ _create_session() {
 
     # Build claude command for the initial pane — use printf %q to prevent injection
     _build_claude_cmd
-    [[ ${#ca[@]} -gt 0 ]] && _cmd_parts+=("${ca[@]}")
+    if [[ ${#ca[@]} -gt 0 ]]; then _cmd_parts+=("${ca[@]}"); fi
     local claude_cmd; claude_cmd="$(printf '%q ' "${_cmd_parts[@]}")"
     claude_cmd="${claude_cmd% }"  # trim trailing space
 
@@ -1192,7 +1196,7 @@ cmd_auto() {
         _info "New session in running container: ${CYAN}${session}${NC}"
 
         _build_claude_cmd
-        [[ $# -gt 0 ]] && _cmd_parts+=("$@")
+        if [[ $# -gt 0 ]]; then _cmd_parts+=("$@"); fi
         local claude_cmd; claude_cmd="$(printf '%q ' "${_cmd_parts[@]}")"
         claude_cmd="${claude_cmd% }"
 
