@@ -26,7 +26,7 @@ Key design decisions:
 ```
 claude-safe              single-file bash script, all logic here (includes `install` subcommand)
 Dockerfile.claude-safe    multi-arch image (ARG TARGETARCH for arm64/amd64)
-config.example.sh        user config template
+config.example           user config template (declarative KEY=VALUE format)
 tmux.conf                tmux config for remote tmux sessions
 CHEATSHEET.md            user-facing quick reference
 README.md                project documentation
@@ -64,15 +64,34 @@ README.md                project documentation
 ### Adding a new mount option
 1. Add default in the "Defaults" section: `: "${CLAUDE_SAFE_MOUNT_THING:=false}"`
 2. Add mount logic in `_build_volume_args()`
-3. Add to `cmd_config()` display
+3. Add to `cmd_config()` display with `$(_cfg_src CLAUDE_SAFE_MOUNT_THING)`
 4. Add check in `cmd_doctor()`
-5. Document in `config.example.sh`
+5. Document in `config.example` (declarative KEY=VALUE format)
+6. Add commented entry to `_generate_override_template()` in the relevant section
 
 ### Adding a new subcommand
 1. Create `cmd_foo()` function
 2. Add case in the main `case` block at the bottom
 3. Add to help text
 4. Add to completion words in `_cs_comp()`
+
+### Per-project config overrides
+Each git repo can have a `.claude-safe/config` file (declarative KEY=VALUE, same format as global config). This is safe to commit — the parser never evals the file.
+
+- `claude-safe custom` — create/edit override for current repo (auto-trusts)
+- `claude-safe custom --list` — show all trusted overrides
+- `claude-safe custom --path` — print override path for current repo
+- `claude-safe custom --rm` — delete override and untrust
+
+Trust state is stored in `~/.config/claude-safe/trusted-overrides`. On first encounter of an untrusted override, users are prompted interactively (like direnv). `CLAUDE_SAFE_NOTIFY_CMD` is intentionally blocked in project overrides (it executes on the host).
+
+`claude-safe config` shows `(default)`, `(global)`, or `(override)` next to each value.
+
+### Migrating from config.sh
+```bash
+claude-safe config --migrate   # converts config.sh → config (declarative)
+# Review ~/.config/claude-safe/config, then delete config.sh
+```
 
 ### Adding a tool to the Docker image
 1. Add to `Dockerfile.claude-safe` — use `${TARGETARCH}` for arch-specific URLs
