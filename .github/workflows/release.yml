@@ -18,7 +18,7 @@ jobs:
       version: ${{ steps.version.outputs.version }}
       created: ${{ steps.check_tag.outputs.created }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
           fetch-depth: 0
 
@@ -41,7 +41,7 @@ jobs:
 
       - name: Create GitHub Release
         if: steps.check_tag.outputs.created == 'true'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@153bb8e04406b158c6c84fc1615b65b24149a1fe # v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: "claude-safe ${{ steps.version.outputs.tag }}"
