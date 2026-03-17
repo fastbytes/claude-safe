@@ -83,7 +83,6 @@ CLAUDE_RW_FILES=(history.jsonl stats-cache.json)
 : "${CLAUDE_SAFE_TMUX_CONF:=}"
 : "${CLAUDE_SAFE_CONTAINER_TMUX_CONF:=/etc/tmux.conf}"
 : "${CLAUDE_SAFE_NOTIFY_CMD:=}"
-: "${CLAUDE_SAFE_OSC52_CLIPBOARD:=true}"
 : "${CLAUDE_SAFE_AUTO_CLEANUP:=true}"
 : "${CLAUDE_SAFE_BUILD_INTERVAL:=86400}"  # seconds between image builds (0=always, -1=never)
 : "${CLAUDE_SAFE_VERSION_CHECK:=true}"
@@ -197,10 +196,38 @@ _auto_setup_container() {
     ' || true
 }
 
-_add_claude_permission_args() {
+_build_claude_cmd() {
+    # Populates _cmd_parts array (dynamic scoping, same pattern as _add_docker_args).
+    # Caller appends extra args to _cmd_parts, then uses them.
+    _cmd_parts=("claude")
     [[ "$CLAUDE_SAFE_PERMISSION_MODE" == "bypass" ]] \
-        && cmd+=(--dangerously-skip-permissions --allow-dangerously-skip-permissions)
-    return 0
+        && _cmd_parts+=(--dangerously-skip-permissions --allow-dangerously-skip-permissions)
+    [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]] && {
+        local _ca_split; read -ra _ca_split <<< "$CLAUDE_SAFE_CLAUDE_ARGS"
+        _cmd_parts+=("${_ca_split[@]}")
+    }
+}
+
+_create_tmux_in_container() {
+    # Create a tmux session inside a container and configure it.
+    local name="$1" session="$2" workspace="$3" claude_cmd="$4"
+    local tmux_args=()
+    [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]] \
+        && tmux_args+=(-f "$CLAUDE_SAFE_CONTAINER_TMUX_CONF")
+    docker exec "$name" tmux "${tmux_args[@]}" new-session -d -s "$session" -c "$workspace" "$claude_cmd"
+    docker exec "$name" tmux set-option -t "$session" default-command "zsh -l"
+    docker exec "$name" tmux set-environment -t "$session" CLAUDE_SAFE "true"
+    docker exec "$name" tmux set-environment -t "$session" CLAUDE_SAFE_WORKSPACE "$workspace"
+}
+
+_detect_creds_store() {
+    [[ -f "$HOME/.docker/config.json" ]] || return 1
+    if command -v jq &>/dev/null; then
+        jq -r '.credsStore // empty' "$HOME/.docker/config.json" 2>/dev/null
+    else
+        grep -o '"credsStore"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.docker/config.json" 2>/dev/null \
+            | grep -o '"[^"]*"$' | tr -d '"'
+    fi
 }
 _sanitize_branch() { echo "$1" | sed 's/[^a-zA-Z0-9._-]/-/g'; }
 _repo_root() { git rev-parse --show-toplevel 2>/dev/null || { _error "Not in a git repo"; exit 1; }; }
@@ -358,7 +385,7 @@ _container_name() {
     local ws="$1"
     local base; base="$(basename "$ws")"
     local project; project="$(basename "$(dirname "$ws")")"
-    local hash; hash="$(echo "$ws" | md5sum | cut -c1-6 2>/dev/null || echo "0")"
+    local hash; hash="$(echo "$ws" | (md5sum 2>/dev/null || md5) | cut -c1-6 2>/dev/null || echo "0")"
     echo "cs-${project}-${base}-${hash}" | sed 's/[^a-zA-Z0-9-]/-/g' | head -c 63
 }
 
@@ -371,7 +398,6 @@ _stop_container() {
     _container_exists "$name" && docker rm -f "$name" &>/dev/null
     docker rm -f "cs-socket-proxy-${name}" &>/dev/null || true
     rm -f "${CLAUDE_HOME}/.credentials.json"
-    true
 }
 
 # ─── Launch backends ────────────────────────────────────────────────────────
@@ -506,7 +532,7 @@ _docker_build() {
     # Build a Docker image with buildx if available, falling back to legacy builder.
     # Usage: _docker_build -t <image> -f <dockerfile> [--no-cache] <context>
     local args=("$@")
-    if docker buildx version &>/dev/null 2>&1; then
+    if docker buildx version &>/dev/null; then
         docker buildx build "${args[@]}"
     else
         local arch; arch="$(uname -m)"
@@ -521,8 +547,8 @@ _maybe_build_image() {
     local image="$1"
     [[ "$CLAUDE_SAFE_BUILD_INTERVAL" == "-1" ]] && return 0
 
-    local stamp_dir="${CONFIG_DIR}" stamp_file="${CONFIG_DIR}/.last-build"
-    [[ -d "$stamp_dir" ]] || mkdir -p "$stamp_dir"
+    local stamp_file="${CONFIG_DIR}/.last-build"
+    [[ -d "$CONFIG_DIR" ]] || mkdir -p "$CONFIG_DIR"
 
     local now; now="$(date +%s)"
     if [[ -f "$stamp_file" ]]; then
@@ -574,10 +600,10 @@ _launch_docker() {
     local cmd=(docker run --rm -it)
     _add_docker_args "$workspace" "$name"
 
-    cmd+=("$image" claude)
-    _add_claude_permission_args
-    [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]] && cmd+=($CLAUDE_SAFE_CLAUDE_ARGS)
-    [[ ${#ca[@]} -gt 0 ]] && cmd+=("${ca[@]}")
+    cmd+=("$image")
+    _build_claude_cmd
+    [[ ${#ca[@]} -gt 0 ]] && _cmd_parts+=("${ca[@]}")
+    cmd+=("${_cmd_parts[@]}")
 
     _dim "→ ${cmd[*]}"
     exec "${cmd[@]}"
@@ -598,10 +624,9 @@ _launch_docker_sandbox() {
 
     _add_volume_args
 
-    cmd+=(claude)
-    _add_claude_permission_args
-    [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]] && cmd+=($CLAUDE_SAFE_CLAUDE_ARGS)
-    [[ ${#ca[@]} -gt 0 ]] && cmd+=("${ca[@]}")
+    _build_claude_cmd
+    [[ ${#ca[@]} -gt 0 ]] && _cmd_parts+=("${ca[@]}")
+    cmd+=("${_cmd_parts[@]}")
 
     _dim "→ ${cmd[*]}"
     exec "${cmd[@]}"
@@ -609,10 +634,9 @@ _launch_docker_sandbox() {
 
 _launch_none() {
     local workspace="$1"; shift; cd "$workspace"
-    local cmd=(claude)
-    _add_claude_permission_args
-    [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]] && cmd+=($CLAUDE_SAFE_CLAUDE_ARGS)
-    cmd+=("$@"); exec "${cmd[@]}"
+    _build_claude_cmd
+    [[ $# -gt 0 ]] && _cmd_parts+=("$@")
+    exec "${_cmd_parts[@]}"
 }
 
 _launch() {
@@ -639,7 +663,7 @@ _launch() {
 _tmux_running_in_container() {
     # Check if tmux server is running inside a container
     local name="$1"
-    docker exec "$name" tmux ls &>/dev/null 2>&1
+    docker exec "$name" tmux ls &>/dev/null
 }
 
 _create_session() {
@@ -653,19 +677,8 @@ _create_session() {
     # Check for Claude Code updates (non-blocking, skip on failure)
     [[ "$CLAUDE_SAFE_VERSION_CHECK" == "true" ]] && _check_claude_version "$name"
 
-    # Build tmux conf arg
-    local tmux_args=()
-    [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]] \
-        && tmux_args+=(-f "$CLAUDE_SAFE_CONTAINER_TMUX_CONF")
-
     # Build claude command for the initial pane — use printf %q to prevent injection
-    local _cmd_parts=("claude")
-    [[ "$CLAUDE_SAFE_PERMISSION_MODE" == "bypass" ]] \
-        && _cmd_parts+=(--dangerously-skip-permissions --allow-dangerously-skip-permissions)
-    [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]] && {
-        local _ca_split; read -ra _ca_split <<< "$CLAUDE_SAFE_CLAUDE_ARGS"
-        _cmd_parts+=("${_ca_split[@]}")
-    }
+    _build_claude_cmd
     [[ ${#ca[@]} -gt 0 ]] && _cmd_parts+=("${ca[@]}")
     local claude_cmd; claude_cmd="$(printf '%q ' "${_cmd_parts[@]}")"
     claude_cmd="${claude_cmd% }"  # trim trailing space
@@ -678,15 +691,7 @@ _create_session() {
         claude_cmd="${claude_cmd}; ${_notify_shell}${_notify_msg}"
     fi
 
-    # Create tmux session INSIDE the container (returns immediately, -d = detached session)
-    docker exec "$name" tmux "${tmux_args[@]}" new-session -d -s "$session" -c "$workspace" "$claude_cmd"
-
-    # Set default command for new panes/windows: sandboxed bash
-    docker exec "$name" tmux set-option -t "$session" default-command "zsh -l"
-
-    # Set tmux env vars for tooling
-    docker exec "$name" tmux set-environment -t "$session" CLAUDE_SAFE "true"
-    docker exec "$name" tmux set-environment -t "$session" CLAUDE_SAFE_WORKSPACE "$workspace"
+    _create_tmux_in_container "$name" "$session" "$workspace" "$claude_cmd"
 }
 
 _attach_session() {
@@ -701,7 +706,7 @@ _attach_session() {
 
     # Auto-cleanup: if no tmux sessions remain, remove the container
     if [[ "$CLAUDE_SAFE_AUTO_CLEANUP" == "true" ]]; then
-        if ! docker exec "$name" tmux list-sessions &>/dev/null 2>&1; then
+        if ! docker exec "$name" tmux list-sessions &>/dev/null; then
             _info "No sessions remaining, cleaning up container..."
             docker rm -f "$name" &>/dev/null
             rm -f "${CLAUDE_HOME}/.credentials.json"
@@ -833,12 +838,7 @@ cmd_install() {
     _ihead "Preflight checks"
     command -v docker &>/dev/null || { _error "Docker not found. Install OrbStack, Colima, or Docker Desktop first."; exit 1; }
     _info "Docker: $(docker --version | head -1)"
-    local _creds_store=""
-    if command -v jq &>/dev/null && [[ -f "$HOME/.docker/config.json" ]]; then
-        _creds_store="$(jq -r '.credsStore // empty' "$HOME/.docker/config.json" 2>/dev/null || true)"
-    elif [[ -f "$HOME/.docker/config.json" ]]; then
-        _creds_store="$(grep -o '"credsStore"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.docker/config.json" 2>/dev/null | grep -o '"[^"]*"$' | tr -d '"')"
-    fi
+    local _creds_store; _creds_store="$(_detect_creds_store || true)"
     if [[ -n "$_creds_store" ]]; then
         if command -v "docker-credential-${_creds_store}" &>/dev/null; then
             _info "docker-credential-${_creds_store}: found"
@@ -965,8 +965,7 @@ CONF
 
     # Build image
     _ihead "Docker image"
-    local dockerfile="$script_dir/Dockerfile.claude-safe"
-    [[ -f "$dockerfile" ]] || dockerfile="$PWD/Dockerfile.claude-safe"
+    local dockerfile; dockerfile="$(_find_dockerfile)"
     if [[ -f "$dockerfile" ]]; then
         if _ask_yn "Build claude-safe image now?" "y"; then
             _pull_base_image "$dockerfile"
@@ -992,6 +991,24 @@ CONF
 }
 
 # ─── Subcommands ─────────────────────────────────────────────────────────────
+
+_find_dockerfile() {
+    local d="${SELF%/*}/Dockerfile.claude-safe"
+    [[ -f "$d" ]] || d="$PWD/Dockerfile.claude-safe"
+    echo "$d"
+}
+
+_attach_or_create() {
+    local name="$1" session="$2" workspace="$3" label="$4"; shift 4
+    if _container_running "$name" && _tmux_running_in_container "$name"; then
+        _info "Reattaching: ${CYAN}${session}${NC}"
+        _attach_session "$name" "$session"
+    else
+        _info "${label}: ${CYAN}${session}${NC}"
+        _create_session "$session" "$workspace" "$@"
+        _attach_session "$name" "$session"
+    fi
+}
 
 cmd_new() {
     local branch="${1:?Usage: $SCRIPT_NAME new <branch> [prompt]}"; shift
@@ -1019,14 +1036,7 @@ cmd_new() {
     local name; name="$(_container_name "$wt_path")"
 
     # If container+tmux already running, just reattach
-    if _container_running "$name" && _tmux_running_in_container "$name"; then
-        _info "Reattaching: ${CYAN}${session}${NC}"
-        _attach_session "$name" "$session"
-    else
-        _info "Session: ${CYAN}${session}${NC}"
-        _create_session "$session" "$wt_path" "$@"
-        _attach_session "$name" "$session"
-    fi
+    _attach_or_create "$name" "$session" "$wt_path" "Session" "$@"
 }
 
 cmd_start() {
@@ -1041,14 +1051,7 @@ cmd_start() {
         return
     fi
 
-    if _container_running "$name" && _tmux_running_in_container "$name"; then
-        _info "Reattaching: ${CYAN}${session}${NC}"
-        _attach_session "$name" "$session"
-    else
-        _info "Starting: ${CYAN}${session}${NC}"
-        _create_session "$session" "$wt_path" "$@"
-        _attach_session "$name" "$session"
-    fi
+    _attach_or_create "$name" "$session" "$wt_path" "Starting" "$@"
 }
 
 cmd_shell() {
@@ -1157,27 +1160,7 @@ cmd_stop() {
 }
 
 
-cmd_dash() {
-    # Show all claude-safe containers and their tmux sessions
-    _require docker
-    local cids
-    cids="$(docker ps --filter 'label=claude-safe=true' --format '{{.Names}}' 2>/dev/null)"
-    if [[ -z "$cids" ]]; then
-        _dim "No claude-safe containers running."
-        return
-    fi
-    echo -e "\n${BOLD}claude-safe containers${NC}\n"
-    while IFS= read -r cname; do
-        local workspace; workspace="$(docker inspect -f '{{index .Config.Labels "claude-safe.workspace"}}' "$cname" 2>/dev/null)"
-        echo -e "  ${GREEN}●${NC} ${CYAN}${cname}${NC}  ${DIM}${workspace}${NC}"
-        if [[ "$CLAUDE_SAFE_TMUX" == "true" ]]; then
-            docker exec "$cname" tmux ls 2>/dev/null | while IFS= read -r ts; do
-                echo -e "    ${DIM}└ ${ts}${NC}"
-            done
-        fi
-    done <<< "$cids"
-    echo ""
-}
+cmd_dash() { cmd_ls; }
 
 cmd_auto() {
     # Smart entry point: detect existing container, reattach or create.
@@ -1208,23 +1191,12 @@ cmd_auto() {
         local session="${CLAUDE_SAFE_TMUX_PREFIX}-$(basename "$workspace")"
         _info "New session in running container: ${CYAN}${session}${NC}"
 
-        local tmux_args=()
-        [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]] \
-            && tmux_args+=(-f "$CLAUDE_SAFE_CONTAINER_TMUX_CONF")
-
-        local _cmd_parts=("claude")
-        [[ "$CLAUDE_SAFE_PERMISSION_MODE" == "bypass" ]] \
-            && _cmd_parts+=(--dangerously-skip-permissions --allow-dangerously-skip-permissions)
-        [[ -n "${CLAUDE_SAFE_CLAUDE_ARGS:-}" ]] && {
-            local _ca_split; read -ra _ca_split <<< "$CLAUDE_SAFE_CLAUDE_ARGS"
-            _cmd_parts+=("${_ca_split[@]}")
-        }
+        _build_claude_cmd
         [[ $# -gt 0 ]] && _cmd_parts+=("$@")
         local claude_cmd; claude_cmd="$(printf '%q ' "${_cmd_parts[@]}")"
         claude_cmd="${claude_cmd% }"
 
-        docker exec "$name" tmux "${tmux_args[@]}" new-session -d -s "$session" -c "$workspace" "$claude_cmd"
-        docker exec "$name" tmux set-option -t "$session" default-command "zsh -l"
+        _create_tmux_in_container "$name" "$session" "$workspace" "$claude_cmd"
         _attach_session "$name" "$session"
         return
     fi
@@ -1257,8 +1229,7 @@ cmd_update() {
     local stamp_file="${CONFIG_DIR}/.last-build"
     mkdir -p "${CONFIG_DIR}"
 
-    local dockerfile="${SELF%/*}/Dockerfile.claude-safe"
-    [[ -f "$dockerfile" ]] || dockerfile="$PWD/Dockerfile.claude-safe"
+    local dockerfile; dockerfile="$(_find_dockerfile)"
     [[ -f "$dockerfile" ]] || { _error "Dockerfile.claude-safe not found"; return 1; }
 
     local build_args=(-f "$dockerfile" -t "$image" "$(dirname "$dockerfile")")
@@ -1304,7 +1275,7 @@ ${BOLD}Mounts${NC}                                     ${BOLD}~/.claude/ detail$
 ${BOLD}Worktree + tmux${NC}                            ${BOLD}Remote / iPad${NC}
   TMUX             ${CLAUDE_SAFE_TMUX}                      TMUX_CONF   ${CLAUDE_SAFE_TMUX_CONF:-<default>}
   WORKTREE_DIR     ${CLAUDE_SAFE_WORKTREE_DIR}              NOTIFY      ${CLAUDE_SAFE_NOTIFY_CMD:-<none>}
-  TMUX_PREFIX      ${CLAUDE_SAFE_TMUX_PREFIX}                  OSC52       ${CLAUDE_SAFE_OSC52_CLIPBOARD}
+  TMUX_PREFIX      ${CLAUDE_SAFE_TMUX_PREFIX}
   SETUP_HOOK       ${CLAUDE_SAFE_SETUP_HOOK}
   CLAUDE_ARGS      ${CLAUDE_SAFE_CLAUDE_ARGS:-<none>}
   PERMISSION_MODE  ${CLAUDE_SAFE_PERMISSION_MODE:-<none>}
@@ -1349,7 +1320,7 @@ cmd_doctor() {
         local _ifs="$IFS"; IFS=':'
         for ctx in $CLAUDE_SAFE_KUBE_PROFILES; do
             IFS="$_ifs"
-            KUBECONFIG="$HOME/.kube/config" kubectl config get-contexts "$ctx" &>/dev/null 2>&1 \
+            KUBECONFIG="$HOME/.kube/config" kubectl config get-contexts "$ctx" &>/dev/null \
                 && echo -e "  ${GREEN}✓${NC} kube context: $ctx" \
                 || echo -e "  ${RED}✗${NC} kube context not found: $ctx"
         done
@@ -1359,7 +1330,7 @@ cmd_doctor() {
 
     # Docker runtime detection
     local _docker_ctx; _docker_ctx="$(docker context show 2>/dev/null || echo "")"
-    if docker version &>/dev/null 2>&1; then
+    if docker version &>/dev/null; then
         local server_info; server_info="$(docker version --format '{{.Server.Platform.Name}}' 2>/dev/null || echo "unknown")"
         if echo "$server_info" | grep -qi orbstack || echo "$_docker_ctx" | grep -qi orbstack; then
             echo -e "  ${GREEN}✓${NC} Docker via OrbStack"
@@ -1367,14 +1338,14 @@ cmd_doctor() {
             echo -e "  ${GREEN}✓${NC} Docker via Colima"
         elif echo "$server_info" | grep -qi "docker desktop"; then
             echo -e "  ${GREEN}✓${NC} Docker via Docker Desktop"
-            docker sandbox version &>/dev/null 2>&1 \
+            docker sandbox version &>/dev/null \
                 && echo -e "  ${GREEN}✓${NC} docker sandbox plugin" \
                 || echo -e "  ${YELLOW}?${NC} docker sandbox (need Desktop 4.50+)"
         else
             echo -e "  ${GREEN}✓${NC} Docker Engine ($server_info)"
         fi
         # buildx check (optional — _docker_build() falls back to legacy builder)
-        if docker buildx version &>/dev/null 2>&1; then
+        if docker buildx version &>/dev/null; then
             echo -e "  ${GREEN}✓${NC} docker buildx"; ok=$((ok+1))
         else
             echo -e "  ${YELLOW}?${NC} docker buildx not found ${DIM}(builds will use legacy builder)${NC}"; w=$((w+1))
@@ -1385,8 +1356,7 @@ cmd_doctor() {
             fi
         fi
         # credential helper check (only when credsStore is configured)
-        local _creds_store=""
-        [[ -f "$HOME/.docker/config.json" ]] && _creds_store="$(grep -o '"credsStore"[[:space:]]*:[[:space:]]*"[^"]*"' "$HOME/.docker/config.json" 2>/dev/null | grep -o '"[^"]*"$' | tr -d '"')"
+        local _creds_store; _creds_store="$(_detect_creds_store || true)"
         if [[ -n "$_creds_store" ]]; then
             if command -v "docker-credential-${_creds_store}" &>/dev/null; then
                 echo -e "  ${GREEN}✓${NC} docker-credential-${_creds_store}"; ok=$((ok+1))
@@ -1406,7 +1376,7 @@ cmd_doctor() {
             && echo -e "  ${GREEN}✓${NC} Template: $CLAUDE_SAFE_TEMPLATE" \
             || echo -e "  ${RED}✗${NC} Template missing: $CLAUDE_SAFE_TEMPLATE (run: docker buildx build)"
         # Verify tmux is available in the image
-        docker run --rm "$CLAUDE_SAFE_TEMPLATE" tmux -V &>/dev/null 2>&1 \
+        docker run --rm "$CLAUDE_SAFE_TEMPLATE" tmux -V &>/dev/null \
             && echo -e "  ${GREEN}✓${NC} tmux in image" \
             || echo -e "  ${RED}✗${NC} tmux not found in image (required for session management)"
     }
@@ -1456,7 +1426,7 @@ cmd_doctor() {
 
     # Quick host-network check
     if [[ "$CLAUDE_SAFE_NETWORK" == "host" ]]; then
-        docker run --rm --network host alpine:3.20 sh -c "echo ok" &>/dev/null 2>&1 \
+        docker run --rm --network host alpine:3.20 sh -c "echo ok" &>/dev/null \
             && echo -e "  ${GREEN}✓${NC} --network host works" \
             || echo -e "  ${YELLOW}?${NC} --network host may not work (check your Docker runtime settings)"
     fi
@@ -1468,7 +1438,7 @@ cmd_doctor() {
             [[ -S /var/run/docker.sock ]] \
                 && { echo -e "  ${GREEN}✓${NC} /var/run/docker.sock exists (proxy mode)"; ok=$((ok+1)); } \
                 || { echo -e "  ${RED}✗${NC} /var/run/docker.sock not found (required for proxy mode)"; f=$((f+1)); }
-            docker pull tecnativa/docker-socket-proxy:latest &>/dev/null 2>&1 \
+            docker pull tecnativa/docker-socket-proxy:latest &>/dev/null \
                 && { echo -e "  ${GREEN}✓${NC} tecnativa/docker-socket-proxy image available"; ok=$((ok+1)); } \
                 || { echo -e "  ${YELLOW}?${NC} tecnativa/docker-socket-proxy not cached — will pull on first launch"; w=$((w+1)); }
             local _orphans; _orphans="$(docker ps -a --filter name=cs-socket-proxy- --format '{{.Names}}' 2>/dev/null)"
@@ -1490,18 +1460,21 @@ cmd_doctor() {
 
 # ─── Completions ─────────────────────────────────────────────────────────────
 
+# Single definition — used both when sourced and emitted by --completions.
+_CS_COMP_BODY='_cs_comp() {
+    local cmds="new start ls rm merge shell stop dash install update config doctor tmux direct"
+    local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
+    case "$cmd" in
+        start|rm|merge|shell|stop)
+            local r d b=""; r="$(git rev-parse --show-toplevel 2>/dev/null)" || return
+            d="${r}/.worktrees"; [[ -d "$d" ]] && b="$(ls "$d" 2>/dev/null)"
+            COMPREPLY=($(compgen -W "$b" -- "$cur")) ;;
+        *) COMPREPLY=($(compgen -W "$cmds" -- "$cur")) ;;
+    esac
+}'
+
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
-    _cs_comp() {
-        local cmds="new start ls rm merge shell stop dash install update config doctor tmux direct"
-        local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
-        case "$cmd" in
-            start|rm|merge|shell|stop)
-                local r d b=""; r="$(git rev-parse --show-toplevel 2>/dev/null)" || return
-                d="${r}/.worktrees"; [[ -d "$d" ]] && b="$(ls "$d" 2>/dev/null)"
-                COMPREPLY=($(compgen -W "$b" -- "$cur")) ;;
-            *) COMPREPLY=($(compgen -W "$cmds" -- "$cur")) ;;
-        esac
-    }
+    eval "$_CS_COMP_BODY"
     complete -F _cs_comp claude-safe; return 0
 fi
 
@@ -1544,39 +1517,40 @@ case "${1:-}" in
             _error "--workspace must be within \$HOME. Got: $workspace"
             exit 1
         fi
-        _launch "$workspace" "${claude_args[@]:-}" ;;
-    --completions) cat << 'COMP'
-_cs_comp() {
-    local cmds="new start ls rm merge shell stop dash install update config doctor tmux direct"
-    local cur="${COMP_WORDS[COMP_CWORD]}" cmd="${COMP_WORDS[1]:-}"
-    case "$cmd" in
-        start|rm|merge|shell|stop)
-            local r d b=""; r="$(git rev-parse --show-toplevel 2>/dev/null)" || return
-            d="${r}/.worktrees"; [[ -d "$d" ]] && b="$(ls "$d" 2>/dev/null)"
-            COMPREPLY=($(compgen -W "$b" -- "$cur")) ;;
-        *) COMPREPLY=($(compgen -W "$cmds" -- "$cur")) ;;
-    esac
-}
-complete -F _cs_comp claude-safe
-COMP
-        ;;
+        _launch "$workspace" "${claude_args[@]}" ;;
+    --completions) printf '%s\n' "$_CS_COMP_BODY" "complete -F _cs_comp claude-safe" ;;
     -h|--help|help) cat << EOF
 ${BOLD}claude-safe v${CLAUDE_SAFE_VERSION}${NC} — Sandboxed Claude Code with worktrees
 
-${BOLD}COMMANDS${NC}
-  (none)                  Smart: reattach or create sandboxed session
-  new <branch> [prompt]   Worktree + sandbox + session
-  start <branch>          Reattach to session       stop <branch>   Stop container
-  ls                      Status overview            rm <branch>     Full cleanup
-  merge <branch> [--squash]                         shell [branch]  Shell into sandbox
-  dash                    Container overview
-  install                 Interactive installer / reconfigure
-  update [--no-cache]     Rebuild Docker image       config          Show config
-  doctor                  Verify setup               --raw [args]    Alias for direct
-  tmux [args]             Force tmux session         direct [args]   Direct launch (no tmux)
-  --dangerous                     Bypass Claude permission prompts (safe in container)
+${BOLD}USAGE${NC}
+  claude-safe [command] [options]
 
-${DIM}Tip: set CLAUDE_SAFE_TMUX=false in config to always launch without tmux (like direct)${NC}
+${BOLD}SESSIONS${NC}
+  (default)               Smart reattach or create session
+  new <branch> [prompt]   Create worktree + sandbox + session
+  start <branch>          Reattach to existing session
+  stop <branch>           Stop container
+  rm <branch>             Stop container + remove worktree
+
+${BOLD}TOOLS${NC}
+  ls                      List containers and sessions
+  dash                    Container overview dashboard
+  merge <branch> [--squash]  Merge worktree branch back
+  shell [branch]          Shell into container
+
+${BOLD}LAUNCH MODES${NC}
+  tmux [args]             Force tmux session
+  direct [args]           Direct launch (no tmux)
+  --raw [args]            Alias for direct
+  --dangerous             Bypass Claude permission prompts
+
+${BOLD}SETUP${NC}
+  install                 Interactive installer / reconfigure
+  update [--no-cache]     Rebuild Docker image
+  config                  Show current configuration
+  doctor                  Verify setup
+
+${DIM}Tip: CLAUDE_SAFE_TMUX=false in config to always launch without tmux${NC}
 EOF
         ;;
     "") cmd_auto ;;

@@ -180,10 +180,6 @@ CLAUDE_SAFE_CONTAINER_TMUX_CONF="/etc/tmux.conf"
 #   "curl -s -d 'Claude finished' ntfy.sh/YOUR_TOPIC"  # ntfy.sh
 CLAUDE_SAFE_NOTIFY_CMD=""
 
-# Enable OSC 52 clipboard forwarding (for remote/SSH sessions)
-# Allows clipboard sync between container and remote terminal (SSH, Mosh, etc.)
-CLAUDE_SAFE_OSC52_CLIPBOARD=true
-
 # ────────────────────────────────────────────────────────────────────────────
 # Maintenance
 # ────────────────────────────────────────────────────────────────────────────
