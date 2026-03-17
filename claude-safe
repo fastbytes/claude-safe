@@ -643,7 +643,7 @@ _maybe_build_image() {
 
     _dim "→ Rebuilding image…"
     _pull_base_image "${SELF%/*}/Dockerfile.claude-safe"
-    if _docker_build -f "${SELF%/*}/Dockerfile.claude-safe" -t "$image" "${SELF%/*}"; then
+    if _docker_build -f "${SELF%/*}/Dockerfile.claude-safe" -t "$image" --build-arg "CLAUDE_CODE_CACHEBUST=$(date +%s)" "${SELF%/*}"; then
         echo "$now" > "$stamp_file"
     else
         _warn "Image build failed — using cached image"
@@ -1322,7 +1322,7 @@ cmd_update() {
     local dockerfile; dockerfile="$(_find_dockerfile)"
     [[ -f "$dockerfile" ]] || { _error "Dockerfile.claude-safe not found"; return 1; }
 
-    local build_args=(-f "$dockerfile" -t "$image" "$(dirname "$dockerfile")")
+    local build_args=(-f "$dockerfile" -t "$image" --build-arg "CLAUDE_CODE_CACHEBUST=$(date +%s)" "$(dirname "$dockerfile")")
     [[ "$no_cache" == "true" ]] && build_args+=(--no-cache)
 
     _info "Building image: ${CYAN}${image}${NC}"

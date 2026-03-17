@@ -239,4 +239,8 @@ ENV DIRENV_CONFIG=/etc/direnv
 # ── grml vim config ──
 RUN curl -fsSL https://git.grml.org/f/grml-etc-core/etc/vim/vimrc -o /etc/vim/vimrc.local
 
+# ── Ensure latest Claude Code (base image may lag npm releases) ──
+ARG CLAUDE_CODE_CACHEBUST=0
+RUN npm install -g @anthropic-ai/claude-code@latest
+
 USER agent
