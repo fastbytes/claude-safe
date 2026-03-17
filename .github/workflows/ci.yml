@@ -25,6 +25,7 @@ jobs:
           scandir: "."
           additional_files: "claude-safe"
           severity: error
+          ignore_paths: "Dockerfile.claude-safe"
 
       - name: Hadolint (Dockerfile lint)
         uses: hadolint/hadolint-action@v3.1.0

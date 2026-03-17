@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 # config.example.sh
 # Example configuration for claude-safe
 # Copy to ~/.config/claude-safe/config.sh and customize
