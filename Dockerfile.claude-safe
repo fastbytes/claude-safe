@@ -36,7 +36,7 @@ ARG XH_VERSION=v0.25.3
 # renovate: datasource=github-releases depName=FiloSottile/age
 ARG AGE_VERSION=v1.3.1
 # renovate: datasource=github-releases depName=getsops/sops
-ARG SOPS_VERSION=v3.12.1
+ARG SOPS_VERSION=v3.12.2
 # renovate: datasource=github-releases depName=fullstorydev/grpcurl
 ARG GRPCURL_VERSION=v1.9.3
 # renovate: datasource=github-releases depName=ahmetb/kubectx
