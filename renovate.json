@@ -14,7 +14,8 @@
       "matchUpdateTypes": ["minor", "patch"],
       "automerge": true,
       "automergeType": "pr",
-      "platformAutomerge": true
+      "platformAutomerge": true,
+      "dependencyDashboardApproval": false
     },
     {
       "description": "Auto-merge GitHub Actions minor + patch updates",
@@ -22,7 +23,8 @@
       "matchUpdateTypes": ["minor", "patch"],
       "automerge": true,
       "automergeType": "pr",
-      "platformAutomerge": true
+      "platformAutomerge": true,
+      "dependencyDashboardApproval": false
     },
     {
       "description": "Claude Code version update — triggers a tagged release",
@@ -30,6 +32,7 @@
       "automerge": true,
       "automergeType": "pr",
       "platformAutomerge": true,
+      "dependencyDashboardApproval": false,
       "commitMessageTopic": "Claude Code to {{newVersion}}",
       "labels": ["dependencies", "claude-code-update"]
     },
@@ -39,7 +42,8 @@
       "matchPackageNames": ["wscat"],
       "automerge": true,
       "automergeType": "pr",
-      "platformAutomerge": true
+      "platformAutomerge": true,
+      "dependencyDashboardApproval": false
     },
     {
       "description": "Major updates require manual review",
