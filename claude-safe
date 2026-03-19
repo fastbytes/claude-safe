@@ -128,7 +128,7 @@ _resolve_image() {
     if [[ -n "$CLAUDE_SAFE_TEMPLATE" ]]; then
         echo "$CLAUDE_SAFE_TEMPLATE"
     else
-        echo "${CLAUDE_SAFE_GHCR_IMAGE}:latest"
+        echo "${CLAUDE_SAFE_GHCR_IMAGE}:${CLAUDE_SAFE_VERSION}"
     fi
 }
 
@@ -178,6 +178,8 @@ _ensure_asset_repo() {
 _update_assets() {
     # Sync asset repo to the tag matching the current script version.
     # Called during cmd_update(). No-op when running from a checkout.
+    # Optional first arg: explicit version to check out (e.g. "2.1.79").
+    local version="${1:-$CLAUDE_SAFE_VERSION}"
     local asset_dir; asset_dir="$(_asset_dir)"
     local repo_dir="${CONFIG_DIR}/repo"
     if [[ "$asset_dir" != "$repo_dir" ]]; then
@@ -185,7 +187,7 @@ _update_assets() {
         return 0
     fi
     _ensure_asset_repo || return 0
-    local tag="v${CLAUDE_SAFE_VERSION}"
+    local tag="v${version}"
     _info "Updating assets to ${CYAN}${tag}${NC}…"
     if git -C "$repo_dir" fetch --depth=1 origin "refs/tags/${tag}:refs/tags/${tag}" 2>/dev/null \
        && git -C "$repo_dir" checkout --quiet "$tag" 2>/dev/null; then
@@ -860,10 +862,9 @@ _self_update() {
     chmod +x "$install_bin"
     rm -f "$tmp"
     _info "Script updated: ${CYAN}${install_bin}${NC} (v${latest})"
-    # If running from the install path, exec the new script to finish image update
-    if [[ "$SELF" == "$install_bin" ]]; then
-        exec "$install_bin" update --skip-script
-    fi
+    # No exec needed: cmd_update() already fetched release_ver from the API before
+    # calling _self_update(), so the current process uses the correct version for
+    # assets and image steps regardless of the embedded CLAUDE_SAFE_VERSION string.
 }
 
 _pull_base_image() {
@@ -1738,18 +1739,30 @@ cmd_update() {
         && mv "${CONFIG_DIR}/.last-build" "$stamp_file"
     mkdir -p "${CONFIG_DIR}"
 
+    # Fetch latest release version once; used by asset and image steps below.
+    local latest_ver; latest_ver="$(_get_latest_script_version 2>/dev/null)" || true
+    local release_ver="${latest_ver:-$CLAUDE_SAFE_VERSION}"
+
     # Step 1: Script self-update from GitHub Releases
     if [[ "$skip_script" == "false" ]]; then
         _self_update || true
     fi
 
     # Step 2: Asset repo sync (Dockerfile, config.example, tmux.conf)
+    # Pass the release version explicitly so assets use the correct tag even when the
+    # embedded CLAUDE_SAFE_VERSION string wasn't bumped in the released script.
     if [[ "$skip_assets" == "false" ]]; then
-        _update_assets || true
+        _update_assets "$release_ver" || true
     fi
 
     # Step 3: Image update
-    local image; image="$(_resolve_image)"
+    local pull_tag="$release_ver"
+    local image
+    if [[ -n "$CLAUDE_SAFE_TEMPLATE" ]]; then
+        image="$CLAUDE_SAFE_TEMPLATE"
+    else
+        image="${CLAUDE_SAFE_GHCR_IMAGE}:${pull_tag}"
+    fi
     if [[ "$build_flag" == "true" ]] || _is_custom_template; then
         # Local build (forced or custom template)
         local dockerfile; dockerfile="$(_find_dockerfile)"
