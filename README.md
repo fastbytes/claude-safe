@@ -31,6 +31,7 @@ Claude Code has unrestricted shell access. Running it on a bare host means it ca
 - Docker (OrbStack recommended on macOS, Docker Engine on Linux)
 - Git
 - Bash 4+
+- jq
 
 tmux is included in the container image — not needed on the host.
 
