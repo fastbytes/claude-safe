@@ -71,10 +71,13 @@ CLAUDE_COW_DIRS=(plugins output-styles cache paste-cache status_lines downloads)
 CLAUDE_RW_FILES=(history.jsonl stats-cache.json mcp-needs-auth-cache.json)
 # ~/.claude files — COPY-ON-WRITE
 CLAUDE_COW_FILES=(settings.json)
-# .credentials.json is handled separately (Keychain extraction on macOS)
+# .credentials.json is handled separately: extracted from Keychain on macOS, then
+# mounted as a COW copy so Claude Code can refresh OAuth tokens during the session.
 # Everything else (CLAUDE.md, commands/, skills/, agents/, hooks/)
 # stays READ-ONLY via the base mount.
 # settings.json, .claude.json, and COW dirs are copy-on-write (host originals untouched).
+
+_MANAGED_API_KEY=""
 
 : "${CLAUDE_SAFE_MEMORY:=}"
 : "${CLAUDE_SAFE_CPUS:=}"
@@ -493,7 +496,21 @@ _prepare_cow_staging() {
     done
 
     # ~/.claude.json (lives outside ~/.claude/)
-    [[ -f "$CLAUDE_JSON" ]] && cp -f "$CLAUDE_JSON" "${cow_dir}/claude.json"
+    if [[ -f "$CLAUDE_JSON" ]]; then
+        cp -f "$CLAUDE_JSON" "${cow_dir}/claude.json"
+        # Patch installMethod for container (host="native", container=npm-global).
+        # API Usage Billing: inject primaryApiKey so container can auth without Keychain.
+        # Pro/Max users: OAuth token in .credentials.json takes precedence; this is ignored.
+        if command -v jq &>/dev/null; then
+            local _patched
+            _patched="$(jq --arg key "${_MANAGED_API_KEY:-}" \
+                '.installMethod = "npm" | if $key != "" then .primaryApiKey = $key else . end' \
+                "${cow_dir}/claude.json" 2>/dev/null)" \
+                && printf '%s\n' "$_patched" > "${cow_dir}/claude.json"
+        else
+            _warn "jq not found -- skipping .claude.json patching (installMethod, primaryApiKey)"
+        fi
+    fi
 }
 
 _notify() {
@@ -666,6 +683,11 @@ _inject_keychain_creds() {
     # File lives in user-only ~/.claude/ (0700 parent). Re-extracted each launch.
     # macOS-native Claude uses Keychain directly and ignores this file.
     [[ "$(uname)" != "Darwin" ]] && return 1
+
+    # API Usage Billing: extract managed API key (separate Keychain entry).
+    # Must run before OAuth extraction — that path can `return 1` early.
+    _MANAGED_API_KEY="$(security find-generic-password -s "Claude Code" -w 2>/dev/null)" || true
+
     local creds
     creds="$(security find-generic-password -s "Claude Code-credentials" -w 2>/dev/null)" || return 1
     [[ -z "$creds" ]] && return 1
@@ -757,9 +779,13 @@ _add_docker_args() {
         for kv in $CLAUDE_SAFE_EXTRA_ENV; do cmd+=(-e "$kv"); done
     }
 
-    # Credentials (host file — populated by _inject_keychain_creds on macOS; read-only to prevent exfiltration/modification)
-    [[ -f "${CLAUDE_HOME}/.credentials.json" ]] && [[ -s "${CLAUDE_HOME}/.credentials.json" ]] \
-        && cmd+=(-v "${CLAUDE_HOME}/.credentials.json:/home/agent/.claude/.credentials.json:ro")
+    # Credentials -- COW copy so Claude Code can refresh OAuth tokens during the session.
+    if [[ -f "${CLAUDE_HOME}/.credentials.json" ]] && [[ -s "${CLAUDE_HOME}/.credentials.json" ]]; then
+        local _cred_cow="${_COW_STAGING_DIR:?}/.credentials.json"
+        cp -f "${CLAUDE_HOME}/.credentials.json" "$_cred_cow"
+        chmod 600 "$_cred_cow"
+        cmd+=(-v "${_cred_cow}:/home/agent/.claude/.credentials.json")
+    fi
 
     # tmux config inside container
     if [[ -n "$CLAUDE_SAFE_TMUX_CONF" ]] && [[ -f "$CLAUDE_SAFE_TMUX_CONF" ]]; then
@@ -1955,6 +1981,7 @@ cmd_doctor() {
 
     _ck command -v git; _ck command -v docker
     _ckw command -v claude; _ckw command -v mosh-server
+    _ckw command -v jq
     _ckw command -v kubectl; _ckw command -v helm; _ckw command -v k9s
     echo ""
     [[ -n "${_GLOBAL_CONFIG_FILE:-}" ]]  && echo -e "  ${GREEN}✓${NC} Config: ${_GLOBAL_CONFIG_FILE}" || echo -e "  ${YELLOW}?${NC} No config"
