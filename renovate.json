@@ -28,7 +28,7 @@
     },
     {
       "description": "Claude Code version update — triggers a tagged release",
-      "matchFileNames": [".github/CLAUDE_CODE_VERSION"],
+      "matchFileNames": ["VERSION"],
       "automerge": true,
       "automergeType": "pr",
       "platformAutomerge": true,
@@ -72,9 +72,9 @@
       "datasourceTemplate": "npm"
     },
     {
-      "description": "Claude Code version tracking — CLAUDE_CODE_VERSION file",
+      "description": "Claude Code version tracking — VERSION file",
       "customType": "regex",
-      "fileMatch": ["^\\.github/CLAUDE_CODE_VERSION$"],
+      "fileMatch": ["^VERSION$"],
       "matchStrings": [
         "^(?<currentValue>[\\d.]+)\\n?$"
       ],

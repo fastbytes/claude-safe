@@ -85,6 +85,7 @@ RUN apt-get update -qq && apt-get install -y -qq --no-install-recommends \
     sqlite3 \
     vim \
     zsh \
+    sox \
     nmap \
     tcpdump \
     direnv \
@@ -241,6 +242,6 @@ RUN curl -fsSL https://git.grml.org/f/grml-etc-core/etc/vim/vimrc -o /etc/vim/vi
 
 # ── Install Claude Code ──
 ARG CLAUDE_CODE_CACHEBUST=0
-RUN npm install -g @anthropic-ai/claude-code@latest
+RUN npm install -g @anthropic-ai/claude-code
 
 USER agent

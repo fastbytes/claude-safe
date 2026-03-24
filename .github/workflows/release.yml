@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
     paths:
-      - .github/CLAUDE_CODE_VERSION
+      - VERSION
   workflow_dispatch:
 
 permissions:
@@ -27,7 +27,7 @@ jobs:
       - name: Read Claude Code version
         id: version
         run: |
-          VERSION=$(tr -d '[:space:]' < .github/CLAUDE_CODE_VERSION)
+          VERSION=$(tr -d '[:space:]' < VERSION)
           echo "version=${VERSION}" >> "$GITHUB_OUTPUT"
           echo "tag=v${VERSION}" >> "$GITHUB_OUTPUT"
 
