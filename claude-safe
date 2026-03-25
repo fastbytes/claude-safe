@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# claude-safe v2.1.78 — Sandboxed Claude Code launcher
+# claude-safe — Sandboxed Claude Code launcher
 #
 # Combines: Docker container isolation (OrbStack / Docker Engine), git worktree
 # management (cmux-compat), in-container tmux session management, granular
@@ -26,7 +26,6 @@
 
 set -euo pipefail
 
-CLAUDE_SAFE_VERSION="2.1.78"
 CLAUDE_SAFE_GHCR_IMAGE="ghcr.io/fastbytes/claude-safe"
 CLAUDE_SAFE_GITHUB_REPO="fastbytes/claude-safe"
 SCRIPT_NAME="claude-safe"
@@ -101,6 +100,15 @@ _MANAGED_API_KEY=""
 : "${CLAUDE_SAFE_VERSION_CHECK:=true}"
 
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/claude-safe"
+
+_resolve_version() {
+    local f="${SELF%/*}/VERSION"
+    [[ -f "$f" ]] && { tr -d '[:space:]' < "$f"; return; }
+    f="${CONFIG_DIR}/version"
+    [[ -f "$f" ]] && { tr -d '[:space:]' < "$f"; return; }
+    echo ""
+}
+CLAUDE_SAFE_VERSION="$(_resolve_version)"
 CONFIG_FILE="${CONFIG_DIR}/config.sh"   # legacy bash config (deprecated)
 _GLOBAL_CONFIG_FILE=""
 _OVERRIDE_FILE=""
@@ -127,8 +135,10 @@ _resolve_image() {
     # Return the Docker image name to use: custom template or GHCR default.
     if [[ -n "$CLAUDE_SAFE_TEMPLATE" ]]; then
         echo "$CLAUDE_SAFE_TEMPLATE"
-    else
+    elif [[ -n "$CLAUDE_SAFE_VERSION" ]]; then
         echo "${CLAUDE_SAFE_GHCR_IMAGE}:${CLAUDE_SAFE_VERSION}"
+    else
+        echo "${CLAUDE_SAFE_GHCR_IMAGE}:latest"
     fi
 }
 
@@ -808,6 +818,7 @@ _check_claude_version() {
 
 _check_script_version() {
     # Warn if a newer claude-safe release is available on GitHub.
+    [[ -z "$CLAUDE_SAFE_VERSION" ]] && return 0
     local latest; latest="$(_get_latest_script_version)" || return 0
     [[ -z "$latest" ]] && return 0
     _version_gt "$latest" "$CLAUDE_SAFE_VERSION" || return 0
@@ -861,10 +872,10 @@ _self_update() {
     cp "$tmp" "$install_bin"
     chmod +x "$install_bin"
     rm -f "$tmp"
+    mkdir -p "$CONFIG_DIR"
+    echo "$latest" > "${CONFIG_DIR}/version"
+    CLAUDE_SAFE_VERSION="$latest"
     _info "Script updated: ${CYAN}${install_bin}${NC} (v${latest})"
-    # No exec needed: cmd_update() already fetched release_ver from the API before
-    # calling _self_update(), so the current process uses the correct version for
-    # assets and image steps regardless of the embedded CLAUDE_SAFE_VERSION string.
 }
 
 _pull_base_image() {
@@ -1434,6 +1445,8 @@ cmd_install() {
     mkdir -p "$install_dir"
     cp "$SELF" "$install_bin"
     chmod +x "$install_bin"
+    mkdir -p "$CONFIG_DIR"
+    echo "$CLAUDE_SAFE_VERSION" > "${CONFIG_DIR}/version"
     _info "Installed → $install_bin"
     command -v claude-safe &>/dev/null || _warn "$install_dir is not in PATH — add to your shell profile: export PATH=\"$install_dir:\$PATH\""
 
@@ -1739,30 +1752,18 @@ cmd_update() {
         && mv "${CONFIG_DIR}/.last-build" "$stamp_file"
     mkdir -p "${CONFIG_DIR}"
 
-    # Fetch latest release version once; used by asset and image steps below.
-    local latest_ver; latest_ver="$(_get_latest_script_version 2>/dev/null)" || true
-    local release_ver="${latest_ver:-$CLAUDE_SAFE_VERSION}"
-
     # Step 1: Script self-update from GitHub Releases
     if [[ "$skip_script" == "false" ]]; then
         _self_update || true
     fi
 
     # Step 2: Asset repo sync (Dockerfile, config.example, tmux.conf)
-    # Pass the release version explicitly so assets use the correct tag even when the
-    # embedded CLAUDE_SAFE_VERSION string wasn't bumped in the released script.
     if [[ "$skip_assets" == "false" ]]; then
-        _update_assets "$release_ver" || true
+        _update_assets "$CLAUDE_SAFE_VERSION" || true
     fi
 
     # Step 3: Image update
-    local pull_tag="$release_ver"
-    local image
-    if [[ -n "$CLAUDE_SAFE_TEMPLATE" ]]; then
-        image="$CLAUDE_SAFE_TEMPLATE"
-    else
-        image="${CLAUDE_SAFE_GHCR_IMAGE}:${pull_tag}"
-    fi
+    local image; image="$(_resolve_image)"
     if [[ "$build_flag" == "true" ]] || _is_custom_template; then
         # Local build (forced or custom template)
         local dockerfile; dockerfile="$(_find_dockerfile)"
@@ -1837,7 +1838,7 @@ cmd_config() {
 
     cat << EOF
 
-${BOLD}claude-safe v${CLAUDE_SAFE_VERSION}${NC}
+${BOLD}claude-safe v${CLAUDE_SAFE_VERSION:-unknown}${NC}
   Config:   ${_GLOBAL_CONFIG_FILE:-<none>}
   Override: ${_OVERRIDE_FILE:-<none>}
 
@@ -2253,10 +2254,10 @@ case "${1:-}" in
     doctor)  cmd_doctor ;;
     tmux)    shift; cmd_tmux "$@" ;;
     direct)  shift; cmd_direct "$@" ;;
-    version|-V) echo "claude-safe v${CLAUDE_SAFE_VERSION}" ;;
+    version|-V) echo "claude-safe v${CLAUDE_SAFE_VERSION:-unknown}" ;;
     --completions) printf '%s\n' "$_CS_COMP_BODY" "complete -F _cs_comp claude-safe" ;;
     -h|--help|help) cat << EOF
-${BOLD}claude-safe v${CLAUDE_SAFE_VERSION}${NC} — Sandboxed Claude Code with worktrees
+${BOLD}claude-safe v${CLAUDE_SAFE_VERSION:-unknown}${NC} — Sandboxed Claude Code with worktrees
 
 ${BOLD}USAGE${NC}
   claude-safe [command] [options]
