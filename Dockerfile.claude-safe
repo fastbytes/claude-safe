@@ -22,7 +22,7 @@ ARG K9S_VERSION=v0.50.18
 # renovate: datasource=github-releases depName=stern/stern
 ARG STERN_VERSION=v1.33.1
 # renovate: datasource=github-releases depName=mikefarah/yq
-ARG YQ_VERSION=v4.52.4
+ARG YQ_VERSION=v4.52.5
 # renovate: datasource=github-releases depName=cli/cli
 ARG GH_VERSION=v2.88.1
 # renovate: datasource=github-releases depName=dandavison/delta
