@@ -26,7 +26,7 @@ ARG YQ_VERSION=v4.52.5
 # renovate: datasource=github-releases depName=cli/cli
 ARG GH_VERSION=v2.89.0
 # renovate: datasource=github-releases depName=dandavison/delta
-ARG DELTA_VERSION=0.19.1
+ARG DELTA_VERSION=0.19.2
 # renovate: datasource=github-releases depName=sharkdp/bat
 ARG BAT_VERSION=v0.26.1
 # renovate: datasource=github-releases depName=vi/websocat
