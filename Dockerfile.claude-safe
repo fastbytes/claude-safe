@@ -46,7 +46,7 @@ ARG CROC_VERSION=v10.4.2
 # renovate: datasource=github-releases depName=FiloSottile/mkcert
 ARG MKCERT_VERSION=v1.4.4
 # renovate: datasource=github-releases depName=go-task/task
-ARG TASK_VERSION=v3.49.1
+ARG TASK_VERSION=v3.50.0
 # renovate: datasource=github-releases depName=casey/just
 ARG JUST_VERSION=1.49.0
 # renovate: datasource=github-releases depName=projectdiscovery/httpx
