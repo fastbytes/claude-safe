@@ -32,7 +32,7 @@ ARG BAT_VERSION=v0.26.1
 # renovate: datasource=github-releases depName=vi/websocat
 ARG WEBSOCAT_VERSION=v1.14.1
 # renovate: datasource=github-releases depName=ducaale/xh
-ARG XH_VERSION=v0.25.3
+ARG XH_VERSION=v0.26.1
 # renovate: datasource=github-releases depName=FiloSottile/age
 ARG AGE_VERSION=v1.3.1
 # renovate: datasource=github-releases depName=getsops/sops
