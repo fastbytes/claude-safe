@@ -42,7 +42,7 @@ ARG GRPCURL_VERSION=v1.9.3
 # renovate: datasource=github-releases depName=ahmetb/kubectx
 ARG KUBECTX_VERSION=v0.11.0
 # renovate: datasource=github-releases depName=schollz/croc
-ARG CROC_VERSION=v10.4.5
+ARG CROC_VERSION=v10.4.6
 # renovate: datasource=github-releases depName=FiloSottile/mkcert
 ARG MKCERT_VERSION=v1.4.4
 # renovate: datasource=github-releases depName=go-task/task
