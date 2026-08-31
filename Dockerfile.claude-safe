@@ -34,7 +34,7 @@ ARG WEBSOCAT_VERSION=v1.14.1
 # renovate: datasource=github-releases depName=ducaale/xh
 ARG XH_VERSION=v0.26.2
 # renovate: datasource=github-releases depName=FiloSottile/age
-ARG AGE_VERSION=v1.3.1
+ARG AGE_VERSION=v1.3.2
 # renovate: datasource=github-releases depName=getsops/sops
 ARG SOPS_VERSION=v3.13.3
 # renovate: datasource=github-releases depName=fullstorydev/grpcurl
