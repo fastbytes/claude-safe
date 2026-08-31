@@ -50,7 +50,7 @@ ARG TASK_VERSION=v3.53.1
 # renovate: datasource=github-releases depName=casey/just
 ARG JUST_VERSION=1.58.0
 # renovate: datasource=github-releases depName=projectdiscovery/httpx
-ARG HTTPX_VERSION=v1.10.0
+ARG HTTPX_VERSION=v1.11.0
 # renovate: datasource=github-releases depName=jesseduffield/lazygit
 ARG LAZYGIT_VERSION=v0.64.1
 # renovate: datasource=github-releases depName=kubernetes-sigs/kustomize versioning=regex:^kustomize/v(?<major>\d+)\.(?<minor>\d+)\.(?<patch>\d+)$
