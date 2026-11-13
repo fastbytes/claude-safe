@@ -30,7 +30,7 @@ ARG DELTA_VERSION=0.20.1
 # renovate: datasource=github-releases depName=sharkdp/bat
 ARG BAT_VERSION=v0.26.1
 # renovate: datasource=github-releases depName=vi/websocat
-ARG WEBSOCAT_VERSION=v1.14.1
+ARG WEBSOCAT_VERSION=v1.14.2
 # renovate: datasource=github-releases depName=ducaale/xh
 ARG XH_VERSION=v0.26.3
 # renovate: datasource=github-releases depName=FiloSottile/age
